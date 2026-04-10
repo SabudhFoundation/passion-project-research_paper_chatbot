@@ -158,6 +158,7 @@ node_modules/
 # Virtual environments
 venv/
 env/
+.env
 *.env
 .env.local
 .env.*.local
@@ -193,7 +194,7 @@ Temporary Items/
 # ──────────────────────────────────────────────────────────────────────────────
 # 8) Project-specific (adjust as needed)
 # ──────────────────────────────────────────────────────────────────────────────
-
+/data/
 # luasrc (if you have a local Lua config)
 .luarc.json
 
