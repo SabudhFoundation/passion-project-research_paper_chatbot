@@ -1,3 +1,7 @@
+'''
+python src/fetch_papers.py --sources arxiv semantic_scholar --query_file data/external/queries.txt --folder_path data/raw --num_pdfs 20 --year 2023
+'''
+
 from __future__ import annotations
 
 import argparse

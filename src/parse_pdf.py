@@ -8,6 +8,8 @@ Arguments:
     --individual_out : Folder to save individual paper JSONs
     --combined_out   : Folder to save combined JSON
 
+python src/parse_pdf.py --pdf_folder data/raw/papers --individual_out data/parsed_individual --combined_out data/parsed_combined --num_pdfs 0
+
 Returns:
     - Individual JSON per paper in individual_out/
     - combined_papers.json in combined_out/
@@ -15,10 +17,12 @@ Returns:
 
 import json
 import argparse
+import re
 from pathlib import Path
 from typing import Optional
 import pymupdf  # PyMuPDF
 from pydantic import BaseModel, Field, validator
+from datetime import datetime
 
 
 # -------------------- SCHEMA --------------------
@@ -56,13 +60,38 @@ def parse_args() -> ParseConfig:
 
 # -------------------- HELPERS --------------------
 
+def extract_year(date_str: str, file_path: Path) -> str:
+    """Extract year from PDF metadata date string."""
+    if not date_str:
+        return "Unknown"
+
+    # Match formats like D:20230405120000
+    match = re.search(r"D:(\d{4})", date_str)
+    if match:
+        return match.group(1)
+
+    # Fallback: any 4-digit year
+    match = re.search(r"(\d{4})", date_str)
+    if match:
+        return match.group(1)
+
+    # Final fallback: file creation time
+    try:
+
+        return str(datetime.fromtimestamp(file_path.stat().st_ctime).year)
+    except Exception:
+        return "Unknown"
+
+
 def extract_metadata_from_doc(doc: pymupdf.Document, file_path: Path) -> dict:
     """Extract available metadata from a PDF document."""
     meta = doc.metadata or {}
+    creation_date = meta.get("creationDate", "")
+
     return {
         "paper_name": meta.get("title") or file_path.stem,
         "author":     meta.get("author") or "Unknown",
-        "year":       meta.get("creationDate", "")[:4].lstrip("D:") or "Unknown",
+        "year":       extract_year(creation_date, file_path),
         "source_file": file_path.name,
         "num_pages":  doc.page_count,
         "subject":    meta.get("subject") or "",
@@ -76,21 +105,22 @@ def extract_text_from_pdf(file_path: Path) -> Optional[dict]:
     Returns a dict ready for JSON serialisation, or None on failure.
     """
     try:
-        doc = pymupdf.open(str(file_path))
-        pages_text = []
+        # Context manager ensures file is always closed
+        with pymupdf.open(str(file_path)) as doc:
+            pages_text = []
 
-        for page_num in range(doc.page_count):
-            page = doc[page_num]
-            text = page.get_text("text").strip()
-            if text:
-                pages_text.append({
-                    "page_number": page_num + 1,
-                    "text": text
-                })
+            for page_num in range(doc.page_count):
+                page = doc[page_num]
+                text = page.get_text("text").strip()
 
-        full_text = "\n\n".join(p["text"] for p in pages_text)
-        metadata  = extract_metadata_from_doc(doc, file_path)
-        doc.close()
+                if text:
+                    pages_text.append({
+                        "page_number": page_num + 1,
+                        "text": text
+                    })
+
+            full_text = "\n\n".join(p["text"] for p in pages_text)
+            metadata  = extract_metadata_from_doc(doc, file_path)
 
         return {
             **metadata,
@@ -135,6 +165,7 @@ def parse_pdfs(config: ParseConfig):
         # Save individual JSON
         safe_name = pdf_path.stem.replace(" ", "_")
         individual_path = config.individual_out / f"{safe_name}.json"
+
         with open(individual_path, "w", encoding="utf-8") as f:
             json.dump(paper_data, f, ensure_ascii=False, indent=2)
 
@@ -144,11 +175,13 @@ def parse_pdfs(config: ParseConfig):
 
     # Save combined JSON
     combined_path = config.combined_out / "combined_papers.json"
+
     with open(combined_path, "w", encoding="utf-8") as f:
         json.dump(combined, f, ensure_ascii=False, indent=2)
 
     print(f"\n✓ Individual JSONs saved : {saved_individual}  →  {config.individual_out}")
     print(f"✓ Combined JSON saved    : {combined_path}")
+
     return combined_path
 
 
