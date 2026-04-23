@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 load_dotenv()
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = "llama3"
 TEMPERATURE = 0.1
 TOP_K = 3
 VECTOR_STORE_PATH = Path("data/vector_store")

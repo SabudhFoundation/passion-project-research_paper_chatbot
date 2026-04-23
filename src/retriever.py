@@ -20,6 +20,20 @@ def _get_embedder(model_name: str = "all-MiniLM-L6-v2") -> SentenceTransformer:
     return _embedder_cache[model_name]
 
 
+class Retriever:
+    def __init__(self, vector_folder: str, embed_model: str = "all-MiniLM-L6-v2"):
+        self.vector_folder = vector_folder
+        self.embed_model = embed_model
+
+    def retrieve(self, question: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        return retrieve(
+            question=question,
+            top_k=top_k,
+            vector_store_folder_path=self.vector_folder,
+            embed_model=self.embed_model
+        )
+
+
 def retrieve(
     question: str,
     top_k: int,
@@ -34,8 +48,6 @@ def retrieve(
     Args:
         question:                 The user query.
         top_k:                    Maximum number of chunks to retrieve.
-                                  Automatically clamped to the collection size
-                                  so ChromaDB never receives n_results > count().
         vector_store_folder_path: Path to the persisted ChromaDB folder.
         embed_model:              Sentence-transformer model name.
         collection_name:          ChromaDB collection to query.
@@ -45,9 +57,6 @@ def retrieve(
             - content    (str)   : The chunk text.
             - metadata   (dict)  : Paper name, section, author, year, etc.
             - similarity (float) : 1 - cosine distance (higher = more relevant).
-
-    Raises:
-        RuntimeError: If the collection does not exist or contains no documents.
     """
     embedder = _get_embedder(embed_model)
 
@@ -82,7 +91,7 @@ def retrieve(
 
     results = collection.query(
         query_embeddings=[query_emb.tolist()],
-        n_results=safe_top_k,  
+        n_results=safe_top_k,
     )
 
     chunks: List[Dict[str, Any]] = []
