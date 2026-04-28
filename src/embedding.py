@@ -102,10 +102,10 @@ def stable_chunk_id(chunk: Dict[str, Any], idx: int) -> str:
 class EmbeddingManager:
     def __init__(self, model_name: str):
         self.model_name = model_name
-        print(f"Loading embedding model: {model_name}")
+        print(f"Loading embedding model: {model_name}", flush=True)
         self.model = SentenceTransformer(model_name)
         self.dim = self.model.get_sentence_embedding_dimension()
-        print(f"Embedding dimension : {self.dim}")
+        print(f"Embedding dimension : {self.dim}", flush=True)
 
     def generate(self, texts: List[str], batch_size: int) -> np.ndarray:
         return self.model.encode(
@@ -148,6 +148,7 @@ class VectorStore:
         self.model_name = model_name
 
         self.client = chromadb.PersistentClient(path=str(persist_dir))
+        self.max_batch_size = self._resolve_max_batch_size()
 
         if reset:
             self._drop_collection()
@@ -155,10 +156,11 @@ class VectorStore:
         self.collection = self._open_or_create_collection()
         self._validate_collection_metadata()
 
-        print(f"Collection '{COLLECTION_NAME}' ready.")
-        print(f"  Embedding model : {model_name}")
-        print(f"  Distance metric : {DISTANCE_METRIC}  (similarity = 1 - distance)")
-        print(f"  Existing vectors: {self.collection.count()}")
+        print(f"Collection '{COLLECTION_NAME}' ready.", flush=True)
+        print(f"  Embedding model : {model_name}", flush=True)
+        print(f"  Distance metric : {DISTANCE_METRIC}  (similarity = 1 - distance)", flush=True)
+        print(f"  Max batch size  : {self.max_batch_size}", flush=True)
+        print(f"  Existing vectors: {self.collection.count()}", flush=True)
 
     # ── private helpers ────────────────────────────────────────────────
 
@@ -168,6 +170,26 @@ class VectorStore:
             print(f"Existing collection '{COLLECTION_NAME}' deleted (--reset).")
         except Exception:
             pass  # collection did not exist yet
+
+    def _resolve_max_batch_size(self) -> int:
+        """
+        Prefer the batch limit reported by the installed Chroma client.
+        Fall back to the observed safe default if the API is unavailable.
+        """
+        candidate = getattr(self.client, "get_max_batch_size", None)
+        if callable(candidate):
+            try:
+                value = int(candidate())
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+
+        candidate = getattr(self.client, "max_batch_size", None)
+        if isinstance(candidate, int) and candidate > 0:
+            return candidate
+
+        return 5461
 
     def _open_or_create_collection(self):
         """
@@ -232,38 +254,52 @@ class VectorStore:
           - Known ID → the document, embedding, and metadata are updated.
           - Unchanged text → same ID → update is a no-op at the storage level.
         """
-        ids:  List[str]        = []
-        docs: List[str]        = []
-        embs: List[List[float]] = []
-        metas: List[Dict]      = []
+        if len(chunks) != len(embeddings):
+            raise ValueError(
+                f"Chunk count ({len(chunks)}) does not match embedding count ({len(embeddings)})."
+            )
 
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            ids.append(stable_chunk_id(chunk, i))
-            docs.append(chunk["text"])
-            embs.append(emb.tolist())
-            metas.append({
-                "paper_name":  str(chunk.get("paper_name",  "") or ""),
-                "author":      str(chunk.get("author",      "") or ""),
-                "year":        str(chunk.get("year",        "") or ""),
-                "section":     str(chunk.get("section",     "") or ""),
-                "page_start":  str(chunk.get("page_start",  "") or ""),
-                "page_end":    str(chunk.get("page_end",    "") or ""),
-                "source_file": str(chunk.get("source_file", "") or ""),
-                # Store similarity interpretation alongside data
-                "distance_metric": DISTANCE_METRIC,
-                "similarity_formula": "1 - cosine_distance",
-            })
+        submitted = 0
 
-        self.collection.upsert(
-            ids=ids,
-            documents=docs,
-            embeddings=embs,
-            metadatas=metas,
-        )
+        for start in range(0, len(chunks), self.max_batch_size):
+            end = min(start + self.max_batch_size, len(chunks))
+
+            ids:  List[str]         = []
+            docs: List[str]         = []
+            embs: List[List[float]] = []
+            metas: List[Dict]       = []
+
+            for i in range(start, end):
+                chunk = chunks[i]
+                emb = embeddings[i]
+
+                ids.append(stable_chunk_id(chunk, i))
+                docs.append(chunk["text"])
+                embs.append(emb.tolist())
+                metas.append({
+                    "paper_name":  str(chunk.get("paper_name",  "") or ""),
+                    "author":      str(chunk.get("author",      "") or ""),
+                    "year":        str(chunk.get("year",        "") or ""),
+                    "section":     str(chunk.get("section",     "") or ""),
+                    "page_start":  str(chunk.get("page_start",  "") or ""),
+                    "page_end":    str(chunk.get("page_end",    "") or ""),
+                    "source_file": str(chunk.get("source_file", "") or ""),
+                    # Store similarity interpretation alongside data
+                    "distance_metric": DISTANCE_METRIC,
+                    "similarity_formula": "1 - cosine_distance",
+                })
+
+            self.collection.upsert(
+                ids=ids,
+                documents=docs,
+                embeddings=embs,
+                metadatas=metas,
+            )
+            submitted += len(ids)
 
         after_count = self.collection.count()
         return {
-            "total_submitted": len(ids),
+            "total_submitted": submitted,
             "collection_size": after_count,
         }
 
@@ -275,38 +311,45 @@ class VectorStore:
 def run_embedding(config: EmbedConfig) -> None:
     start = time.time()
 
+    print("[START] embedding pipeline initializing...", flush=True)
+
     # ── Load chunks ───────────────────────────────────────────────────
+    print(f"[LOAD] Reading chunks from {config.chunk_file}...", flush=True)
     with open(config.chunk_file, "r", encoding="utf-8") as f:
         chunks: List[Dict[str, Any]] = json.load(f)
 
-    print(f"Loaded {len(chunks)} chunks from {config.chunk_file}")
+    print(f"Loaded {len(chunks)} chunks from {config.chunk_file}", flush=True)
 
     if not chunks:
-        print("Nothing to embed. Exiting.")
+        print("Nothing to embed. Exiting.", flush=True)
         return
 
     # ── Generate embeddings ───────────────────────────────────────────
+    print("[EMBED] Loading sentence-transformer model...", flush=True)
     manager = EmbeddingManager(config.model_name)
     texts = [c["text"] for c in chunks]
+    print(f"[EMBED] Encoding {len(texts)} chunk(s)...", flush=True)
     embeddings = manager.generate(texts, config.batch_size)
 
     # ── Store in ChromaDB ─────────────────────────────────────────────
+    print("[STORE] Opening vector store...", flush=True)
     store = VectorStore(
         persist_dir=config.vector_folder,
         model_name=config.model_name,
         reset=config.reset,
     )
 
+    print("[STORE] Writing embeddings to ChromaDB...", flush=True)
     summary = store.upsert(chunks, embeddings)
 
     # ── Report ────────────────────────────────────────────────────────
     elapsed = round(time.time() - start, 2)
-    print(f"\n{'─'*50}")
-    print(f"  Chunks submitted : {summary['total_submitted']}")
-    print(f"  Collection size  : {summary['collection_size']}")
-    print(f"  Elapsed          : {elapsed}s")
-    print(f"{'─'*50}")
-    print(f" Done. Vectors stored at: {config.vector_folder}")
+    print(f"\n{'─'*50}", flush=True)
+    print(f"  Chunks submitted : {summary['total_submitted']}", flush=True)
+    print(f"  Collection size  : {summary['collection_size']}", flush=True)
+    print(f"  Elapsed          : {elapsed}s", flush=True)
+    print(f"{'─'*50}", flush=True)
+    print(f" Done. Vectors stored at: {config.vector_folder}", flush=True)
 
 
 
@@ -315,5 +358,5 @@ def run_embedding(config: EmbedConfig) -> None:
 
 if __name__ == "__main__":
     cfg = parse_args()
-    print("\nCONFIG:", cfg)
+    print("\nCONFIG:", cfg, flush=True)
     run_embedding(cfg)
