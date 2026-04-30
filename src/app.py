@@ -13,7 +13,7 @@ load_dotenv()
 
 MODEL_NAME = "llama3"
 TEMPERATURE = 0.1
-TOP_K = 3
+TOP_K = 10
 VECTOR_STORE_PATH = Path("data/vector_store")
 EMBED_MODEL = "all-MiniLM-L6-v2"
 OUTPUT_JSON_PATH = Path("data/results/output.json")
@@ -35,10 +35,6 @@ question = st.text_area(
     height=110,
 )
 ask = st.button("Ask", type="primary")
-
-# 1. Place the log output inside a collapsed expander
-with st.expander("Thinking..."):
-    log_placeholder = st.empty()
 
 live_logs = []
 
@@ -88,6 +84,8 @@ if ask:
 
     result_container = {}
     live_logs.clear()
+    log_placeholder = None
+    thinking_visible = False
 
     def worker():
         result_container["result"] = run_pipeline_with_logs(config)
@@ -98,16 +96,18 @@ if ask:
     while thread.is_alive():
         time.sleep(0.3)
         if live_logs:
+            if not thinking_visible:
+                with st.expander("Thinking", expanded=True):
+                    log_placeholder = st.empty()
+                thinking_visible = True
             log_placeholder.code("\n".join(live_logs[-20:]), language="text")
 
     thread.join()
 
     result = result_container.get("result", {})
     
-    if live_logs:
+    if thinking_visible and live_logs:
         log_placeholder.code("\n".join(live_logs), language="text")
-    else:
-        log_placeholder.write("Done.")
 
     st.subheader("Answer")
     st.write(result.get("answer", ""))
