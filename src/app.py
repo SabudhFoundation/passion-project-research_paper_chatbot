@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 load_dotenv()
 
-MODEL_NAME = "llama3"
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TEMPERATURE = 0.1
-TOP_K = 10
+TOP_K = 3
 VECTOR_STORE_PATH = Path("data/vector_store")
 EMBED_MODEL = "all-MiniLM-L6-v2"
 OUTPUT_JSON_PATH = Path("data/results/output.json")
