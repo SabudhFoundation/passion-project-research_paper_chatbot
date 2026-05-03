@@ -3,9 +3,9 @@ main.py
 Goal: Orchestrate routing → retrieval → answer generation.
 
 Example:
-    python main.py \\
+    python src/main.py \\
         --question "What is the Transformer architecture?" \\
-        --model_name llama-3.3-70b-versatile \\
+        --model_name  gemini-1.5-flash \\
         --temperature 0.1 \\
         --vector_store_path ../data/vector_store \\
         --output_json_path ../data/results/output.json \\
@@ -19,29 +19,36 @@ import json
 import os
 import re
 import time
+import google.generativeai as genai
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+from config import (
+    MODEL_NAME,
+    TEMPERATURE,
+    TOP_K,
+    VECTOR_STORE_PATH,
+    EMBED_MODEL,
+    OUTPUT_JSON_PATH,
+    MAX_ROUTE_RETRIES,
+    ROUTE_RETRY_DELAY,
+)
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+
 from pydantic import BaseModel, Field, field_validator
 
-from prompt import route_query, summarize_non_rag, summarize_rag
+from prompt import route_query
 
 load_dotenv()
-
-MAX_ROUTE_RETRIES = 2
-ROUTE_RETRY_DELAY = 0.75
 
 
 class MainConfig(BaseModel):
     question: str
-    model_name: str = "llama-3.3-70b-versatile"
-    temperature: float = Field(default=0.1, ge=0.0, le=1.0)
-    vector_store_path: Path
-    output_json_path: Path
-    top_k: int = Field(default=3, gt=0, le=20)
-    embed_model: str = "all-MiniLM-L6-v2"
+    model_name: str = MODEL_NAME
+    temperature: float = Field(default=TEMPERATURE, ge=0.0, le=1.0)
+    vector_store_path: Path = VECTOR_STORE_PATH
+    output_json_path: Path = OUTPUT_JSON_PATH
+    top_k: int = Field(default=TOP_K, gt=0, le=20)
+    embed_model: str = EMBED_MODEL
 
     @field_validator("vector_store_path")
     @classmethod
@@ -54,12 +61,12 @@ class MainConfig(BaseModel):
 def parse_args() -> MainConfig:
     parser = argparse.ArgumentParser(description="RAG Pipeline — main entry point")
     parser.add_argument("--question", type=str, required=True)
-    parser.add_argument("--model_name", type=str, default="llama-3.3-70b-versatile")
-    parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--vector_store_path", type=str, required=True)
-    parser.add_argument("--output_json_path", type=str, required=True)
-    parser.add_argument("--top_k", type=int, default=3)
-    parser.add_argument("--embed_model", type=str, default="all-MiniLM-L6-v2")
+    parser.add_argument("--model_name", type=str, default=MODEL_NAME)
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE)
+    parser.add_argument("--vector_store_path", type=str, default=str(VECTOR_STORE_PATH))
+    parser.add_argument("--output_json_path", type=str, default=str(OUTPUT_JSON_PATH))
+    parser.add_argument("--top_k", type=int, default=TOP_K)
+    parser.add_argument("--embed_model", type=str, default=EMBED_MODEL)
     args = parser.parse_args()
 
     return MainConfig(
@@ -73,17 +80,20 @@ def parse_args() -> MainConfig:
     )
 
 
-def build_llm(model_name: str, temperature: float) -> ChatGroq:
-    from langchain_groq import ChatGroq
-    api_key = os.getenv("GROQ_API_KEY")
+def build_llm(model_name: str, temperature: float):
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise EnvironmentError("GROQ_API_KEY not set in environment / .env")
-    return ChatGroq(
-        groq_api_key=api_key,
+        raise EnvironmentError("GEMINI_API_KEY not set in environment / .env")
+
+    genai.configure(api_key=api_key)
+
+    model = genai.GenerativeModel(
         model_name=model_name,
-        temperature=temperature,
-        max_tokens=1024,
+        generation_config={
+            "temperature": temperature,
+        }
     )
+    return model
 
 
 def _try_parse_route(raw_response: str) -> Optional[str]:
@@ -101,13 +111,13 @@ def _try_parse_route(raw_response: str) -> Optional[str]:
     return route if route in ("rag", "non_rag") else None
 
 
-def classify_route(question: str, llm: ChatGroq) -> str:
+def classify_route(question: str, llm) -> str:
     routing_prompt = route_query(question)
     last_api_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_ROUTE_RETRIES + 1):
         try:
-            raw_response = llm.invoke(routing_prompt).content.strip()
+            raw_response = llm.generate_content(routing_prompt).text.strip()
             last_api_error = None
         except Exception as exc:
             last_api_error = exc
@@ -174,7 +184,7 @@ def _error_result(config: MainConfig, error: str, elapsed: float) -> Dict[str, A
 
 
 def run_pipeline(config: MainConfig) -> Dict[str, Any]:
-    from prompt import route_query, summarize_non_rag, summarize_rag
+    from prompt import summarize_non_rag, summarize_rag
     start = time.time()
     retrieved_chunks: list[dict[str, Any]] = []
 
@@ -217,12 +227,12 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
                 print("[LLM] Generating final answer...", flush=True)
                 t3 = time.time()
-                answer = llm.invoke(summarize_rag(config.question, context)).content
+                answer = llm.generate_content(summarize_rag(config.question, context)).text
                 print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
         else:
             print("[LLM] Generating final answer...", flush=True)
             t3 = time.time()
-            answer = llm.invoke(summarize_non_rag(config.question)).content
+            answer = llm.generate_content(summarize_non_rag(config.question)).text
             print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
 
         elapsed = round(time.time() - start, 2)

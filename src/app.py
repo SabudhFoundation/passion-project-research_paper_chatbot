@@ -4,19 +4,13 @@ import sys
 import threading
 import time
 from pathlib import Path
-
+from config import MODEL_NAME, TEMPERATURE, TOP_K, VECTOR_STORE_PATH, EMBED_MODEL, OUTPUT_JSON_PATH
 import streamlit as st
 from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 load_dotenv()
 
-MODEL_NAME = "llama-3.3-70b-versatile"
-TEMPERATURE = 0.1
-TOP_K = 10
-VECTOR_STORE_PATH = Path("data/vector_store")
-EMBED_MODEL = "all-MiniLM-L6-v2"
-OUTPUT_JSON_PATH = Path("data/results/output.json")
 
 @st.cache_resource
 def warmup_model():

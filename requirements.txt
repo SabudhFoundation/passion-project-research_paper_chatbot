@@ -24,6 +24,7 @@ faiss-cpu
 chromadb
 langchain-groq
 langchain-text-splitters
+google-generativeai
 numpy
 
 
