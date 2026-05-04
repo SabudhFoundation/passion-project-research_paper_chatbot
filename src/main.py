@@ -16,10 +16,8 @@ Example:
 """
 import argparse
 import json
-import os
 import re
 import time
-import google.generativeai as genai
 from pathlib import Path
 from typing import Any, Dict, Optional
 from config import (
@@ -36,7 +34,9 @@ from dotenv import load_dotenv
 
 from pydantic import BaseModel, Field, field_validator
 
+from llm import build_llm
 from prompt import route_query
+from utilities import error_result, save_result
 
 load_dotenv()
 
@@ -44,6 +44,7 @@ load_dotenv()
 class MainConfig(BaseModel):
     question: str
     model_name: str = MODEL_NAME
+    provider: Optional[str] = None
     temperature: float = Field(default=TEMPERATURE, ge=0.0, le=1.0)
     vector_store_path: Path = VECTOR_STORE_PATH
     output_json_path: Path = OUTPUT_JSON_PATH
@@ -62,6 +63,7 @@ def parse_args() -> MainConfig:
     parser = argparse.ArgumentParser(description="RAG Pipeline — main entry point")
     parser.add_argument("--question", type=str, required=True)
     parser.add_argument("--model_name", type=str, default=MODEL_NAME)
+    parser.add_argument("--provider", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=TEMPERATURE)
     parser.add_argument("--vector_store_path", type=str, default=str(VECTOR_STORE_PATH))
     parser.add_argument("--output_json_path", type=str, default=str(OUTPUT_JSON_PATH))
@@ -72,28 +74,13 @@ def parse_args() -> MainConfig:
     return MainConfig(
         question=args.question,
         model_name=args.model_name,
+        provider=args.provider,
         temperature=args.temperature,
         vector_store_path=Path(args.vector_store_path),
         output_json_path=Path(args.output_json_path),
         top_k=args.top_k,
         embed_model=args.embed_model,
     )
-
-
-def build_llm(model_name: str, temperature: float):
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise EnvironmentError("GEMINI_API_KEY not set in environment / .env")
-
-    genai.configure(api_key=api_key)
-
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        generation_config={
-            "temperature": temperature,
-        }
-    )
-    return model
 
 
 def _try_parse_route(raw_response: str) -> Optional[str]:
@@ -156,33 +143,6 @@ def classify_route(question: str, llm) -> str:
     return "non_rag"
 
 
-def _save_result(config: MainConfig, result: Dict[str, Any]) -> Path:
-    out_path = config.output_json_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.is_dir():
-        out_path = out_path / "result.json"
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    return out_path
-
-
-def _error_result(config: MainConfig, error: str, elapsed: float) -> Dict[str, Any]:
-    return {
-        "question": config.question,
-        "route": "error",
-        "answer": "",
-        "error": error,
-        "model_name": config.model_name,
-        "temperature": config.temperature,
-        "vector_store_path": str(config.vector_store_path),
-        "top_k": config.top_k,
-        "time_taken_sec": elapsed,
-        "retrieved_chunks": [],
-    }
-
-
 def run_pipeline(config: MainConfig) -> Dict[str, Any]:
     from prompt import summarize_non_rag, summarize_rag
     start = time.time()
@@ -190,7 +150,8 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
     try:
         print("[INIT] Initializing LLM...", flush=True)
-        llm = build_llm(config.model_name, config.temperature)
+        llm = build_llm(config.model_name, config.temperature, provider=config.provider)
+        print(f"[INIT] LLM in use: provider={config.provider or 'auto'}, model={config.model_name}", flush=True)
 
         print("\n[ROUTER] Sending request to LLM...", flush=True)
         t1 = time.time()
@@ -259,9 +220,17 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
     except Exception as exc:
         elapsed = round(time.time() - start, 2)
-        result = _error_result(config, str(exc), elapsed)
+        result = error_result(
+            question=config.question,
+            model_name=config.model_name,
+            temperature=config.temperature,
+            vector_store_path=config.vector_store_path,
+            top_k=config.top_k,
+            elapsed=elapsed,
+            error=str(exc),
+        )
 
-    out_path = _save_result(config, result)
+    out_path = save_result(config.output_json_path, result)
 
     print("\n========== ANSWER ==========", flush=True)
     print(result.get("answer", ""), flush=True)

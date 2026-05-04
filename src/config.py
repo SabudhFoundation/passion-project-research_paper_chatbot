@@ -1,7 +1,12 @@
 from pathlib import Path
 
 # Model & LLM settings
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-2.5-flash" # Backend default model used by main.py / CLI fallback.
+
+MODEL_OPTIONS: dict[str, tuple[str, str]] = {
+	"Gemini: gemini-2.5-flash": ("gemini", "gemini-2.5-flash"),
+	"Groq: llama-3.3-70b-versatile": ("groq", "llama-3.3-70b-versatile"),
+}
 TEMPERATURE = 0.1
 TOP_K = 10
 EMBED_MODEL = "all-MiniLM-L6-v2"

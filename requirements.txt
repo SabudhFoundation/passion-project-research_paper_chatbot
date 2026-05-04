@@ -26,6 +26,7 @@ langchain-groq
 langchain-text-splitters
 google-generativeai
 numpy
+openpyxl
 
 
 
