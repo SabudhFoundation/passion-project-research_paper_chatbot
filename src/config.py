@@ -18,3 +18,6 @@ OUTPUT_JSON_PATH = Path("data/results/output.json")
 # Retry settings
 MAX_ROUTE_RETRIES = 2
 ROUTE_RETRY_DELAY = 0.75
+
+# Memory settings
+MEMORY_WINDOW = 3  # number of previous interactions to consider

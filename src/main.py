@@ -29,6 +29,7 @@ from config import (
     OUTPUT_JSON_PATH,
     MAX_ROUTE_RETRIES,
     ROUTE_RETRY_DELAY,
+    MEMORY_WINDOW,
 )
 from dotenv import load_dotenv
 
@@ -39,6 +40,9 @@ from prompt import route_query
 from utilities import error_result, save_result
 
 load_dotenv()
+
+# Simple in-memory conversation buffer
+CONVERSATION_MEMORY = []
 
 
 class MainConfig(BaseModel):
@@ -98,8 +102,8 @@ def _try_parse_route(raw_response: str) -> Optional[str]:
     return route if route in ("rag", "non_rag") else None
 
 
-def classify_route(question: str, llm) -> str:
-    routing_prompt = route_query(question)
+def classify_route(question: str, llm, memory=None) -> str:
+    routing_prompt = route_query(question, memory=memory)
     last_api_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_ROUTE_RETRIES + 1):
@@ -153,9 +157,12 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
         llm = build_llm(config.model_name, config.temperature, provider=config.provider)
         print(f"[INIT] LLM in use: provider={config.provider or 'auto'}, model={config.model_name}", flush=True)
 
+        # Get last N interactions
+        recent_memory = CONVERSATION_MEMORY[-MEMORY_WINDOW:]
+
         print("\n[ROUTER] Sending request to LLM...", flush=True)
         t1 = time.time()
-        route = classify_route(config.question, llm)
+        route = classify_route(config.question, llm, recent_memory)
         print(f"[ROUTER DONE] {round(time.time() - t1, 2)}s", flush=True)
         print(f"[ROUTE] → {route}", flush=True)
 
@@ -188,15 +195,31 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
                 print("[LLM] Generating final answer...", flush=True)
                 t3 = time.time()
-                answer = llm.generate_content(summarize_rag(config.question, context)).text
+                answer = llm.generate_content(
+                    summarize_rag(config.question, context, recent_memory)
+                ).text
                 print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
         else:
             print("[LLM] Generating final answer...", flush=True)
             t3 = time.time()
-            answer = llm.generate_content(summarize_non_rag(config.question)).text
+            answer = llm.generate_content(
+                summarize_non_rag(config.question, recent_memory)
+            ).text
             print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
 
         elapsed = round(time.time() - start, 2)
+
+        # Store current interaction
+
+        CONVERSATION_MEMORY.append({
+            "question": config.question,
+            "answer": answer,
+            "route": route,
+        })
+
+        # Keep memory bounded
+        if len(CONVERSATION_MEMORY) > MEMORY_WINDOW:
+            CONVERSATION_MEMORY.pop(0)
 
         result: Dict[str, Any] = {
             "question": config.question,

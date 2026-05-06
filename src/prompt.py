@@ -11,6 +11,7 @@ from typing import Optional, List
 def route_query(
     question: str,
     valid_pipelines: Optional[List[str]] = None,
+    memory=None,
 ) -> str:
     """
     Build a classifier prompt that instructs the LLM to route
@@ -19,6 +20,7 @@ def route_query(
     Args:
         question:         The user query.
         valid_pipelines:  Allowed pipeline labels. Defaults to ["rag", "non_rag"].
+        memory:           Optional list of recent interactions (dicts with 'question', 'answer', 'route').
 
     Returns:
         A prompt string (not the LLM response).
@@ -28,10 +30,23 @@ def route_query(
 
     pipelines_str = ", ".join(f'"{p}"' for p in valid_pipelines)
 
+    memory_block = ""
+    if memory:
+        formatted = "\n\n".join(
+            f"Q: {m['question']}\nRoute: {m['route']}"
+            for m in memory
+        )
+        memory_block = f"""Recent conversation history (context for routing):
+{formatted}
+
+Consider this history when routing the current question. If this is a follow-up, maintain consistency with previous routing decisions.
+
+"""
+
     return f"""You are a query routing assistant. \
 Your only job is to classify the user question into exactly one of these pipelines: {pipelines_str}.
 
-Routing rules:
+{memory_block}Routing rules:
 - Use "rag" for: questions about AI research papers, specific models, methods, \
 experiments, citations, technical retrieval needs, or anything requiring knowledge \
 from a document store.
@@ -50,16 +65,15 @@ Your entire response must be exactly one of these two tokens:
 User question: {question}"""
 
 
-def summarize_rag(question: str, context: str) -> str:
+def summarize_rag(question: str, context: str, memory=None) -> str:
     """
     Build a prompt for answering a question using retrieved context.
+    Optionally considers recent conversation memory for relevance.
 
     Args:
         question: The user query.
         context:  Non-empty retrieved context string.
-                  Callers (main.py) must guarantee this is non-empty;
-                  sending an empty-context RAG prompt is a logic error
-                  that main.py now catches before calling this function.
+        memory:   Optional list of recent interactions (dicts with 'question', 'answer', 'route').
 
     Returns:
         A prompt string (not the LLM response).
@@ -70,14 +84,34 @@ def summarize_rag(question: str, context: str) -> str:
             "Handle the no-chunks case in the caller before invoking this function."
         )
 
-    return f"""You are a knowledgeable research assistant. \
-Answer the user's question using ONLY the provided context.
+    memory_block = ""
+
+    if memory:
+        formatted = "\n\n".join(
+            f"Q: {m['question']}\nA: {m['answer']}"
+            for m in memory
+        )
+
+        memory_block = f"""
+Previous conversation (may or may not be relevant):
+{formatted}
+
+IMPORTANT:
+- First, decide if the previous conversation is relevant to the current question.
+- If relevant, use it to improve the answer.
+- If NOT relevant, completely ignore it.
+"""
+
+    return f"""You are a knowledgeable research assistant.
+
+{memory_block}
 
 Instructions:
-- Focus on information directly relevant to the question.
-- If the context is insufficient to answer fully, clearly state what is missing.
-- Be concise, professional, and informative.
-- Do not fabricate information not present in the context.
+- Use the retrieved context as the primary source of truth.
+- You may use relevant previous conversation ONLY to improve continuity or clarity.
+- If context is insufficient, say so clearly.
+- Be concise and accurate.
+- Do not hallucinate.
 
 Context:
 {context.strip()}
@@ -87,23 +121,38 @@ Question: {question}
 Answer:"""
 
 
-def summarize_non_rag(question: str) -> str:
+def summarize_non_rag(question: str, memory=None) -> str:
     """
     Build a prompt for answering a general (non-RAG) question without retrieval.
+    Optionally considers recent conversation memory for continuity.
 
-    The caller decides whether to route here based on the query classifier.
+    Args:
+        question: The user query.
+        memory:   Optional list of recent interactions (dicts with 'question', 'answer', 'route').
 
     Returns:
         A prompt string (not the LLM response).
     """
-    return f"""You are a friendly and professional AI assistant specialising in AI research.
+    memory_block = ""
 
-Instructions:
-- Respond in a friendly, professional, and helpful tone.
-- If the user is asking about AI research papers in general, guide them to ask a more
-  specific question (e.g., a particular paper, method, or result).
-- If the user sends a greeting, respond politely and invite a research-related question.
-- Keep answers concise.
+    if memory:
+        formatted = "\n\n".join(
+            f"Q: {m['question']}\nA: {m['answer']}"
+            for m in memory
+        )
+
+        memory_block = f"""
+Previous conversation:
+{formatted}
+
+IMPORTANT:
+- Use previous conversation ONLY if relevant.
+- Otherwise ignore it.
+"""
+
+    return f"""You are a friendly and professional AI assistant.
+
+{memory_block}
 
 User message: {question}
 
