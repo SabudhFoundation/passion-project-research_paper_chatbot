@@ -2,14 +2,16 @@
 python src/chunking.py --combined_json data/parsed_combined/combined_papers.json --output_folder data/chunks --chunk_size 800 --chunk_overlap 150
 """
 
+import argparse
 import json
 import re
-import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field, field_validator
+
+from utilities import save_json
 
 
 # CONFIG
@@ -341,8 +343,7 @@ def chunk_papers(config: ChunkConfig) -> Path:
 
     output_path = config.output_folder / "chunks.json"
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(all_chunks, f, indent=2, ensure_ascii=False)
+    save_json(all_chunks, output_path)
 
     print(f"\nSaved: {output_path}")
     return output_path

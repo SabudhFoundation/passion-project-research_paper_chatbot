@@ -3,9 +3,9 @@ main.py
 Goal: Orchestrate routing → retrieval → answer generation.
 
 Example:
-    python main.py \\
+    python src/main.py \\
         --question "What is the Transformer architecture?" \\
-        --model_name llama-3.3-70b-versatile \\
+        --model_name  gemini-1.5-flash \\
         --temperature 0.1 \\
         --vector_store_path ../data/vector_store \\
         --output_json_path ../data/results/output.json \\
@@ -16,32 +16,44 @@ Example:
 """
 import argparse
 import json
-import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+from config import (
+    MODEL_NAME,
+    TEMPERATURE,
+    TOP_K,
+    VECTOR_STORE_PATH,
+    EMBED_MODEL,
+    OUTPUT_JSON_PATH,
+    MAX_ROUTE_RETRIES,
+    ROUTE_RETRY_DELAY,
+    MEMORY_WINDOW,
+)
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+
 from pydantic import BaseModel, Field, field_validator
 
-from prompt import route_query, summarize_non_rag, summarize_rag
+from llm import build_llm
+from prompt import route_query
+from utilities import error_result, save_result
 
 load_dotenv()
 
-MAX_ROUTE_RETRIES = 2
-ROUTE_RETRY_DELAY = 0.75
+# Simple in-memory conversation buffer
+CONVERSATION_MEMORY = []
 
 
 class MainConfig(BaseModel):
     question: str
-    model_name: str = "llama-3.3-70b-versatile"
-    temperature: float = Field(default=0.1, ge=0.0, le=1.0)
-    vector_store_path: Path
-    output_json_path: Path
-    top_k: int = Field(default=3, gt=0, le=20)
-    embed_model: str = "all-MiniLM-L6-v2"
+    model_name: str = MODEL_NAME
+    provider: Optional[str] = None
+    temperature: float = Field(default=TEMPERATURE, ge=0.0, le=1.0)
+    vector_store_path: Path = VECTOR_STORE_PATH
+    output_json_path: Path = OUTPUT_JSON_PATH
+    top_k: int = Field(default=TOP_K, gt=0, le=20)
+    embed_model: str = EMBED_MODEL
 
     @field_validator("vector_store_path")
     @classmethod
@@ -54,35 +66,24 @@ class MainConfig(BaseModel):
 def parse_args() -> MainConfig:
     parser = argparse.ArgumentParser(description="RAG Pipeline — main entry point")
     parser.add_argument("--question", type=str, required=True)
-    parser.add_argument("--model_name", type=str, default="llama-3.3-70b-versatile")
-    parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--vector_store_path", type=str, required=True)
-    parser.add_argument("--output_json_path", type=str, required=True)
-    parser.add_argument("--top_k", type=int, default=3)
-    parser.add_argument("--embed_model", type=str, default="all-MiniLM-L6-v2")
+    parser.add_argument("--model_name", type=str, default=MODEL_NAME)
+    parser.add_argument("--provider", type=str, default=None)
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE)
+    parser.add_argument("--vector_store_path", type=str, default=str(VECTOR_STORE_PATH))
+    parser.add_argument("--output_json_path", type=str, default=str(OUTPUT_JSON_PATH))
+    parser.add_argument("--top_k", type=int, default=TOP_K)
+    parser.add_argument("--embed_model", type=str, default=EMBED_MODEL)
     args = parser.parse_args()
 
     return MainConfig(
         question=args.question,
         model_name=args.model_name,
+        provider=args.provider,
         temperature=args.temperature,
         vector_store_path=Path(args.vector_store_path),
         output_json_path=Path(args.output_json_path),
         top_k=args.top_k,
         embed_model=args.embed_model,
-    )
-
-
-def build_llm(model_name: str, temperature: float) -> ChatGroq:
-    from langchain_groq import ChatGroq
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise EnvironmentError("GROQ_API_KEY not set in environment / .env")
-    return ChatGroq(
-        groq_api_key=api_key,
-        model_name=model_name,
-        temperature=temperature,
-        max_tokens=1024,
     )
 
 
@@ -101,13 +102,13 @@ def _try_parse_route(raw_response: str) -> Optional[str]:
     return route if route in ("rag", "non_rag") else None
 
 
-def classify_route(question: str, llm: ChatGroq) -> str:
-    routing_prompt = route_query(question)
+def classify_route(question: str, llm, memory=None) -> str:
+    routing_prompt = route_query(question, memory=memory)
     last_api_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_ROUTE_RETRIES + 1):
         try:
-            raw_response = llm.invoke(routing_prompt).content.strip()
+            raw_response = llm.generate_content(routing_prompt).text.strip()
             last_api_error = None
         except Exception as exc:
             last_api_error = exc
@@ -146,45 +147,22 @@ def classify_route(question: str, llm: ChatGroq) -> str:
     return "non_rag"
 
 
-def _save_result(config: MainConfig, result: Dict[str, Any]) -> Path:
-    out_path = config.output_json_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.is_dir():
-        out_path = out_path / "result.json"
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    return out_path
-
-
-def _error_result(config: MainConfig, error: str, elapsed: float) -> Dict[str, Any]:
-    return {
-        "question": config.question,
-        "route": "error",
-        "answer": "",
-        "error": error,
-        "model_name": config.model_name,
-        "temperature": config.temperature,
-        "vector_store_path": str(config.vector_store_path),
-        "top_k": config.top_k,
-        "time_taken_sec": elapsed,
-        "retrieved_chunks": [],
-    }
-
-
 def run_pipeline(config: MainConfig) -> Dict[str, Any]:
-    from prompt import route_query, summarize_non_rag, summarize_rag
+    from prompt import summarize_non_rag, summarize_rag
     start = time.time()
     retrieved_chunks: list[dict[str, Any]] = []
 
     try:
         print("[INIT] Initializing LLM...", flush=True)
-        llm = build_llm(config.model_name, config.temperature)
+        llm = build_llm(config.model_name, config.temperature, provider=config.provider)
+        print(f"[INIT] LLM in use: provider={config.provider or 'auto'}, model={config.model_name}", flush=True)
+
+        # Get last N interactions
+        recent_memory = CONVERSATION_MEMORY[-MEMORY_WINDOW:]
 
         print("\n[ROUTER] Sending request to LLM...", flush=True)
         t1 = time.time()
-        route = classify_route(config.question, llm)
+        route = classify_route(config.question, llm, recent_memory)
         print(f"[ROUTER DONE] {round(time.time() - t1, 2)}s", flush=True)
         print(f"[ROUTE] → {route}", flush=True)
 
@@ -217,20 +195,37 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
                 print("[LLM] Generating final answer...", flush=True)
                 t3 = time.time()
-                answer = llm.invoke(summarize_rag(config.question, context)).content
+                answer = llm.generate_content(
+                    summarize_rag(config.question, context, recent_memory)
+                ).text
                 print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
         else:
             print("[LLM] Generating final answer...", flush=True)
             t3 = time.time()
-            answer = llm.invoke(summarize_non_rag(config.question)).content
+            answer = llm.generate_content(
+                summarize_non_rag(config.question, recent_memory)
+            ).text
             print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
 
         elapsed = round(time.time() - start, 2)
+
+        # Store current interaction
+
+        CONVERSATION_MEMORY.append({
+            "question": config.question,
+            "answer": answer,
+            "route": route,
+        })
+
+        # Keep memory bounded
+        if len(CONVERSATION_MEMORY) > MEMORY_WINDOW:
+            CONVERSATION_MEMORY.pop(0)
 
         result: Dict[str, Any] = {
             "question": config.question,
             "route": route,
             "answer": answer,
+            "provider": config.provider,
             "model_name": config.model_name,
             "temperature": config.temperature,
             "vector_store_path": str(config.vector_store_path),
@@ -249,9 +244,18 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
     except Exception as exc:
         elapsed = round(time.time() - start, 2)
-        result = _error_result(config, str(exc), elapsed)
+        result = error_result(
+            question=config.question,
+            provider=config.provider,
+            model_name=config.model_name,
+            temperature=config.temperature,
+            vector_store_path=config.vector_store_path,
+            top_k=config.top_k,
+            elapsed=elapsed,
+            error=str(exc),
+        )
 
-    out_path = _save_result(config, result)
+    out_path = save_result(config.output_json_path, result, append=True)
 
     print("\n========== ANSWER ==========", flush=True)
     print(result.get("answer", ""), flush=True)

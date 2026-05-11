@@ -4,19 +4,26 @@ import sys
 import threading
 import time
 from pathlib import Path
-
+from config import (
+    EMBED_MODEL,
+    MODEL_OPTIONS,
+    OUTPUT_JSON_PATH,
+    TEMPERATURE,
+    TOP_K,
+    VECTOR_STORE_PATH,
+)
 import streamlit as st
 from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 load_dotenv()
 
-MODEL_NAME = "llama-3.3-70b-versatile"
-TEMPERATURE = 0.1
-TOP_K = 10
-VECTOR_STORE_PATH = Path("data/vector_store")
-EMBED_MODEL = "all-MiniLM-L6-v2"
-OUTPUT_JSON_PATH = Path("data/results/output.json")
+from utilities import reset_output_file
+
+if "output_file_initialized" not in st.session_state:
+    reset_output_file(OUTPUT_JSON_PATH)
+    st.session_state.output_file_initialized = True
+
 
 @st.cache_resource
 def warmup_model():
@@ -26,8 +33,29 @@ def warmup_model():
 warmup_model()
 
 st.set_page_config(page_title="Research Paper Chatbot", layout="centered")
+st.markdown(
+    """
+    <style>
+    div[data-baseweb="select"] input {
+        caret-color: transparent !important;
+        cursor: pointer !important;
+    }
+    div[data-baseweb="select"] [role="combobox"] {
+        cursor: pointer !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("Research Paper Chatbot")
 st.write("Ask questions about your research papers.")
+
+selected_model_label = st.selectbox(
+    "Select model",
+    list(MODEL_OPTIONS.keys()),
+    index=0,
+)
+provider_value, model_name = MODEL_OPTIONS[selected_model_label]
 
 question = st.text_area(
     "Your question",
@@ -74,7 +102,8 @@ if ask:
 
     config = MainConfig(
         question=question.strip(),
-        model_name=MODEL_NAME,
+        model_name=model_name,
+        provider=provider_value,
         temperature=TEMPERATURE,
         vector_store_path=VECTOR_STORE_PATH,
         output_json_path=OUTPUT_JSON_PATH,

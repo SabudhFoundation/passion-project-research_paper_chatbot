@@ -15,7 +15,6 @@ Returns:
     - combined_papers.json in combined_out/
 """
 
-import json
 import argparse
 import re
 from pathlib import Path
@@ -23,6 +22,8 @@ from typing import Optional
 import pymupdf  # PyMuPDF
 from pydantic import BaseModel, Field, validator
 from datetime import datetime
+
+from utilities import save_json
 
 
 # -------------------- SCHEMA --------------------
@@ -166,8 +167,7 @@ def parse_pdfs(config: ParseConfig):
         safe_name = pdf_path.stem.replace(" ", "_")
         individual_path = config.individual_out / f"{safe_name}.json"
 
-        with open(individual_path, "w", encoding="utf-8") as f:
-            json.dump(paper_data, f, ensure_ascii=False, indent=2)
+        save_json(paper_data, individual_path)
 
         print(f"  Saved → {individual_path}")
         saved_individual += 1
@@ -176,8 +176,7 @@ def parse_pdfs(config: ParseConfig):
     # Save combined JSON
     combined_path = config.combined_out / "combined_papers.json"
 
-    with open(combined_path, "w", encoding="utf-8") as f:
-        json.dump(combined, f, ensure_ascii=False, indent=2)
+    save_json(combined, combined_path)
 
     print(f"\n✓ Individual JSONs saved : {saved_individual}  →  {config.individual_out}")
     print(f"✓ Combined JSON saved    : {combined_path}")
