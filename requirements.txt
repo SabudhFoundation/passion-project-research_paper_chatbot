@@ -27,6 +27,6 @@ langchain-text-splitters
 google-generativeai
 numpy
 openpyxl
-
+huggingface_hub
 
 

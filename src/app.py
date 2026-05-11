@@ -18,6 +18,12 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 load_dotenv()
 
+from utilities import reset_output_file
+
+if "output_file_initialized" not in st.session_state:
+    reset_output_file(OUTPUT_JSON_PATH)
+    st.session_state.output_file_initialized = True
+
 
 @st.cache_resource
 def warmup_model():

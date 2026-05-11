@@ -4,9 +4,32 @@ from pathlib import Path
 MODEL_NAME = "gemini-2.5-flash" # Backend default model used by main.py / CLI fallback.
 
 MODEL_OPTIONS: dict[str, tuple[str, str]] = {
-	"Gemini: gemini-2.5-flash": ("gemini", "gemini-2.5-flash"),
-	"Groq: llama-3.3-70b-versatile": ("groq", "llama-3.3-70b-versatile"),
+    "Gemini: gemini-2.5-flash": (
+        "gemini",
+        "gemini-2.5-flash",
+    ),
+
+    "Groq: llama-3.3-70b-versatile": (
+        "groq",
+        "llama-3.3-70b-versatile",
+    ),
+	
+    "Hugging Face: Qwen2.5-72B": (
+        "huggingface",
+        "Qwen/Qwen2.5-72B-Instruct",
+    ),
+
+    "Hugging Face: Qwen2.5-7B": (
+        "huggingface",
+        "Qwen/Qwen2.5-7B-Instruct",
+    ),
+    
+    "Hugging Face: DeepSeek-R1": (
+        "huggingface",
+        "deepseek-ai/DeepSeek-R1",
+    ),
 }
+
 TEMPERATURE = 0.1
 TOP_K = 10
 EMBED_MODEL = "all-MiniLM-L6-v2"

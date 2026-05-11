@@ -225,6 +225,7 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
             "question": config.question,
             "route": route,
             "answer": answer,
+            "provider": config.provider,
             "model_name": config.model_name,
             "temperature": config.temperature,
             "vector_store_path": str(config.vector_store_path),
@@ -245,6 +246,7 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
         elapsed = round(time.time() - start, 2)
         result = error_result(
             question=config.question,
+            provider=config.provider,
             model_name=config.model_name,
             temperature=config.temperature,
             vector_store_path=config.vector_store_path,
@@ -253,7 +255,7 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
             error=str(exc),
         )
 
-    out_path = save_result(config.output_json_path, result)
+    out_path = save_result(config.output_json_path, result, append=True)
 
     print("\n========== ANSWER ==========", flush=True)
     print(result.get("answer", ""), flush=True)

@@ -90,6 +90,43 @@ class GroqClient(BaseLLMClient):
 
         return LLMResponse(text=text, raw=payload)
 
+class HuggingFaceClient(BaseLLMClient):
+    def __init__(self, model_name: str, temperature: float, api_key: Optional[str] = None) -> None:
+        try:
+            from huggingface_hub import InferenceClient
+        except ImportError as exc:
+            raise ImportError(
+                "Run: pip install huggingface_hub"
+            ) from exc
+
+        self.temperature = temperature
+        self.model_name = model_name
+        token = api_key or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN")
+        if not token:
+            raise EnvironmentError("HF_TOKEN not set in .env")
+
+        self._client = InferenceClient(
+            model=model_name,
+            token=token,
+        )
+    
+    def generate_content(self, prompt: str) -> LLMResponse:
+        try:
+            response = self._client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=self.temperature,
+            )
+            text = response.choices[0].message.content.strip()
+        except Exception:
+            # Fallback for non-chat models
+            response = self._client.text_generation(
+                prompt=prompt,
+                max_new_tokens=1024,
+                temperature=self.temperature,
+            )
+            text = response.strip()
+        return LLMResponse(text=text, raw=response)
 
 def normalize_provider_name(provider: Optional[str], model_name: str) -> str:
     if provider:
@@ -104,6 +141,8 @@ def normalize_provider_name(provider: Optional[str], model_name: str) -> str:
         "google": "gemini",
         "gemini": "gemini",
         "groq": "groq",
+        "huggingface": "huggingface",
+        "hf": "huggingface",
     }
 
     if provider:
@@ -114,12 +153,25 @@ def normalize_provider_name(provider: Optional[str], model_name: str) -> str:
 
 def build_llm(model_name: str, temperature: float, provider: Optional[str] = None, **kwargs: Any) -> BaseLLMClient:
     resolved_provider = normalize_provider_name(provider, model_name)
-    model_name = model_name.split(":", 1)[1] if ":" in model_name and resolved_provider != "gemini" else model_name
 
     if resolved_provider == "gemini":
-        return GeminiClient(model_name=model_name, temperature=temperature, api_key=kwargs.get("api_key"))
+        return GeminiClient(
+            model_name=model_name, 
+            temperature=temperature, 
+            api_key=kwargs.get("api_key")
+        )
     if resolved_provider == "groq":
-        return GroqClient(model_name=model_name, temperature=temperature, api_key=kwargs.get("api_key"))
+        return GroqClient(
+            model_name=model_name, 
+            temperature=temperature, 
+            api_key=kwargs.get("api_key")
+        )
+    if resolved_provider == "huggingface":
+        return HuggingFaceClient(
+            model_name=model_name,
+            temperature=temperature,
+            api_key=kwargs.get("api_key"),
+        )
 
     raise ValueError(f"Unsupported LLM provider: {resolved_provider}")
 
