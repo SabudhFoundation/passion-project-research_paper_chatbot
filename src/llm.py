@@ -111,21 +111,12 @@ class HuggingFaceClient(BaseLLMClient):
         )
     
     def generate_content(self, prompt: str) -> LLMResponse:
-        try:
-            response = self._client.chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
-                temperature=self.temperature,
-            )
-            text = response.choices[0].message.content.strip()
-        except Exception:
-            # Fallback for non-chat models
-            response = self._client.text_generation(
-                prompt=prompt,
-                max_new_tokens=1024,
-                temperature=self.temperature,
-            )
-            text = response.strip()
+        response = self._client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=self.temperature,
+        )
+        text = response.choices[0].message.content.strip()
         return LLMResponse(text=text, raw=response)
 
 def normalize_provider_name(provider: Optional[str], model_name: str) -> str:
