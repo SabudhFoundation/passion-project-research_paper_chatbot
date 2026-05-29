@@ -28,5 +28,9 @@ google-generativeai
 numpy
 openpyxl
 huggingface_hub
+deepeval
+
+tiktoken>=0.7.0
+
 
 
