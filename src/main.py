@@ -30,14 +30,24 @@ from config import (
     MAX_ROUTE_RETRIES,
     ROUTE_RETRY_DELAY,
     MEMORY_WINDOW,
+    METRICS_JSON_PATH,
 )
 from dotenv import load_dotenv
 
 from pydantic import BaseModel, Field, field_validator
 
-from llm import build_llm
+from llm import (
+    build_llm,
+    normalize_provider_name,
+)
 from prompt import route_query
 from utilities import error_result, save_result
+from metrics import (
+    Timer,
+    build_stage_metrics,
+    build_overall_metrics,
+    save_metrics,
+)
 
 load_dotenv()
 
@@ -52,6 +62,7 @@ class MainConfig(BaseModel):
     temperature: float = Field(default=TEMPERATURE, ge=0.0, le=1.0)
     vector_store_path: Path = VECTOR_STORE_PATH
     output_json_path: Path = OUTPUT_JSON_PATH
+    metrics_json_path: Path = METRICS_JSON_PATH
     top_k: int = Field(default=TOP_K, gt=0, le=20)
     embed_model: str = EMBED_MODEL
 
@@ -71,6 +82,7 @@ def parse_args() -> MainConfig:
     parser.add_argument("--temperature", type=float, default=TEMPERATURE)
     parser.add_argument("--vector_store_path", type=str, default=str(VECTOR_STORE_PATH))
     parser.add_argument("--output_json_path", type=str, default=str(OUTPUT_JSON_PATH))
+    parser.add_argument("--metrics_json_path", type=str, default=str(METRICS_JSON_PATH))
     parser.add_argument("--top_k", type=int, default=TOP_K)
     parser.add_argument("--embed_model", type=str, default=EMBED_MODEL)
     args = parser.parse_args()
@@ -82,6 +94,7 @@ def parse_args() -> MainConfig:
         temperature=args.temperature,
         vector_store_path=Path(args.vector_store_path),
         output_json_path=Path(args.output_json_path),
+        metrics_json_path=Path(args.metrics_json_path),
         top_k=args.top_k,
         embed_model=args.embed_model,
     )
@@ -102,8 +115,15 @@ def _try_parse_route(raw_response: str) -> Optional[str]:
     return route if route in ("rag", "non_rag") else None
 
 
-def classify_route(question: str, llm, memory=None) -> str:
+def classify_route(
+    question: str,
+    llm,
+    provider: str,
+    model_name: str,
+    memory=None,
+):
     routing_prompt = route_query(question, memory=memory)
+    route_start = time.time()
     last_api_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_ROUTE_RETRIES + 1):
@@ -122,8 +142,18 @@ def classify_route(question: str, llm, memory=None) -> str:
 
         route = _try_parse_route(raw_response)
         if route is not None:
+
+            routing_metrics = build_stage_metrics(
+                prompt=routing_prompt,
+                response=raw_response,
+                provider=provider,
+                model_name=model_name,
+                latency=round(time.time() - route_start, 3),
+            )
+
             print(f"[main] Route decided: '{route}' (attempt {attempt})", flush=True)
-            return route
+
+            return route, routing_metrics
 
         print(
             f"[main] Could not parse a valid route from response "
@@ -144,7 +174,16 @@ def classify_route(question: str, llm, memory=None) -> str:
         f"{MAX_ROUTE_RETRIES} attempt(s). Defaulting to 'non_rag'.",
         flush=True,
     )
-    return "non_rag"
+
+    fallback_metrics = build_stage_metrics(
+        prompt=routing_prompt,
+        response="non_rag",
+        provider=provider,
+        model_name=model_name,
+        latency=round(time.time() - route_start, 3),
+    )
+
+    return "non_rag", fallback_metrics
 
 
 def run_pipeline(config: MainConfig) -> Dict[str, Any]:
@@ -152,7 +191,20 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
     start = time.time()
     retrieved_chunks: list[dict[str, Any]] = []
 
+    route = "error"
+
+    resolved_provider = config.provider or "unknown"
+
+    routing_metrics = {}
+    generation_metrics = {}
+    overall_metrics = {}
+
     try:
+        resolved_provider = normalize_provider_name(
+            config.provider,
+            config.model_name,
+        )
+
         print("[INIT] Initializing LLM...", flush=True)
         llm = build_llm(config.model_name, config.temperature, provider=config.provider)
         print(f"[INIT] LLM in use: provider={config.provider or 'auto'}, model={config.model_name}", flush=True)
@@ -161,9 +213,20 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
         recent_memory = CONVERSATION_MEMORY[-MEMORY_WINDOW:]
 
         print("\n[ROUTER] Sending request to LLM...", flush=True)
-        t1 = time.time()
-        route = classify_route(config.question, llm, recent_memory)
-        print(f"[ROUTER DONE] {round(time.time() - t1, 2)}s", flush=True)
+
+        route, routing_metrics = classify_route(
+            config.question,
+            llm,
+            provider=resolved_provider,
+            model_name=config.model_name,
+            memory=recent_memory,
+        )
+
+        print(
+            f"[ROUTER DONE] {routing_metrics['time_taken_sec']}s",
+            flush=True,
+        )
+
         print(f"[ROUTE] → {route}", flush=True)
 
         if route == "rag":
@@ -186,28 +249,79 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
                     "No relevant documents were found in the knowledge base for your question. "
                     "Please rephrase it or ask about a different paper or method."
                 )
+
+                generation_metrics = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "input_cost": 0.0,
+                    "output_cost": 0.0,
+                    "total_cost": 0.0,
+                    "time_taken_sec": 0.0,
+                }
             else:
                 context = "\n\n".join(
-                    f"[Source: {chunk['metadata'].get('paper_name', '?')} | "
-                    f"Section: {chunk['metadata'].get('section', '?')}]\n{chunk['content']}"
+                    f"[Source: {chunk['metadata'].get('paper_name', '?')} | Section: {chunk['metadata'].get('section', '?')}]\n{chunk['content']}"
                     for chunk in retrieved_chunks
                 )
 
                 print("[LLM] Generating final answer...", flush=True)
-                t3 = time.time()
+
+                final_prompt = summarize_rag(
+                    config.question,
+                    context,
+                    recent_memory,
+                )
+
+                generation_timer = Timer()
+
                 answer = llm.generate_content(
-                    summarize_rag(config.question, context, recent_memory)
+                    final_prompt
                 ).text
-                print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
+
+                generation_latency = generation_timer.stop()
+
+                generation_metrics = build_stage_metrics(
+                    prompt=final_prompt,
+                    response=answer,
+                    provider=resolved_provider,
+                    model_name=config.model_name,
+                    latency=generation_latency,
+                )
+
+                print(f"[LLM DONE] {generation_latency}s", flush=True)
         else:
             print("[LLM] Generating final answer...", flush=True)
-            t3 = time.time()
+
+            final_prompt = summarize_non_rag(
+                config.question,
+                recent_memory,
+            )
+
+            generation_timer = Timer()
+
             answer = llm.generate_content(
-                summarize_non_rag(config.question, recent_memory)
+                final_prompt
             ).text
-            print(f"[LLM DONE] {round(time.time() - t3, 2)}s", flush=True)
+
+            generation_latency = generation_timer.stop()
+
+            generation_metrics = build_stage_metrics(
+                prompt=final_prompt,
+                response=answer,
+                provider=resolved_provider,
+                model_name=config.model_name,
+                latency=generation_latency,
+            )
+
+            print(f"[LLM DONE] {generation_latency}s", flush=True)
 
         elapsed = round(time.time() - start, 2)
+
+        overall_metrics = build_overall_metrics(
+            routing_metrics,
+            generation_metrics,
+            elapsed,
+        )
 
         # Store current interaction
 
@@ -244,6 +358,14 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
     except Exception as exc:
         elapsed = round(time.time() - start, 2)
+
+        overall_metrics = {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "grand_total_cost": 0.0,
+            "total_pipeline_time_sec": elapsed,
+        }
+
         result = error_result(
             question=config.question,
             provider=config.provider,
@@ -257,12 +379,49 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
     out_path = save_result(config.output_json_path, result, append=True)
 
-    print("\n========== ANSWER ==========", flush=True)
-    print(result.get("answer", ""), flush=True)
+    metrics_payload = {
+
+        "question": config.question,
+
+        "route": route,
+
+        "provider": resolved_provider,
+
+        "model_name": config.model_name,
+
+        "routing_metrics": routing_metrics,
+
+        "generation_metrics": generation_metrics,
+
+        "overall_metrics": overall_metrics,
+    }
+
+    save_metrics(
+        metrics_payload,
+        config.metrics_json_path,
+    )
+
+    print("\n========== RESULT ==========", flush=True)
+    if result.get("error"):
+        print(f"ERROR: {result['error']}", flush=True)
+    else:
+        print(result.get("answer", ""), flush=True)
     print("============================", flush=True)
     print(f"Route        : {result.get('route')}", flush=True)
     print(f"Result saved : {out_path}", flush=True)
     print(f"Time taken   : {result.get('time_taken_sec')}s", flush=True)
+
+    print("\n========== METRICS ==========", flush=True)
+
+    print(
+        json.dumps(
+            metrics_payload,
+            indent=2,
+        ),
+        flush=True,
+    )
+
+    print("=============================", flush=True)
 
     return result
 
