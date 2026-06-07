@@ -4,9 +4,7 @@ Goal: Build prompt strings for the LLM.
       No LLM calls, no DB access, no final answers — only prompt construction.
 """
 
-from typing import Optional, List
-
-
+from typing import Any, Optional, List
 
 def route_query(
     question: str,
@@ -231,3 +229,80 @@ User message:
 
 Response:
 """
+
+def build_table_vision_prompt(table: dict[str, Any]) -> str:
+    caption = table.get("caption", "")
+    markdown = table.get("markdown", "")
+    structured_status = table.get("structured_status", "")
+    extraction_method = table.get("extraction_method", "")
+    quality_reason = table.get("quality_reason", "")
+
+    return f"""
+You are reading a table image from a research paper.
+
+Your task:
+1. Describe what the table contains.
+2. Reconstruct the table as Markdown if the image is readable.
+3. Preserve important rows, columns, metrics, values, model names, and comparisons.
+4. Do not invent values that are not visible.
+5. If something is unclear, mention it in limitations.
+
+Known metadata:
+Caption: {caption}
+Structured status: {structured_status}
+Extraction method: {extraction_method}
+Quality reason: {quality_reason}
+
+Existing extracted table text/markdown, if available:
+{markdown}
+
+Return ONLY valid JSON with this schema:
+{{
+  "vision_description": "clear natural-language description of the table",
+  "vision_markdown": "markdown table reconstructed from the image, or empty string if not readable",
+  "confidence": "high | medium | low",
+  "limitations": "any uncertainty or empty string"
+}}
+""".strip()
+
+
+def build_visual_vision_prompt(
+    visual: dict[str, Any],
+    generate_mermaid: bool = False,
+) -> str:
+    caption = visual.get("caption", "")
+    content_type = visual.get("content_type", "figure")
+    existing_description = visual.get("description", "")
+
+    mermaid_instruction = ""
+    if generate_mermaid:
+        mermaid_instruction = """
+If the image is a flowchart, framework, architecture, or process diagram,
+also create Mermaid.js syntax. If Mermaid is not appropriate, return an empty string.
+"""
+
+    return f"""
+You are reading a visual artifact from a research paper.
+
+Artifact type: {content_type}
+Caption: {caption}
+Existing description: {existing_description}
+
+Your task:
+1. Explain what the image/figure/diagram shows.
+2. Identify important components, arrows, stages, labels, axes, or relationships.
+3. If it is a chart/plot, explain the trend and what the axes or legend represent.
+4. If it is a framework/architecture/flowchart, explain the flow step by step.
+5. Do not invent details that are not visible.
+6. If something is unclear, mention it in limitations.
+
+{mermaid_instruction}
+
+Return ONLY valid JSON with this schema:
+{{
+  "vision_description": "clear natural-language description of the visual",
+  "mermaid": "Mermaid.js syntax or empty string",
+  "confidence": "high | medium | low",
+  "limitations": "any uncertainty or empty string"
+}}
+""".strip()

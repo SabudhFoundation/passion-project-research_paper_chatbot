@@ -1,43 +1,111 @@
 """
+chunking.py
+
+Creates typed chunks for text and multimodal artifacts.
+
+- text chunks are split normally
+- each table is kept as one atomic chunk
+- each figure / image / diagram / flowchart is kept as one atomic chunk
+
+Run:
 python src/chunking.py --combined_json data/parsed_combined/combined_papers.json --output_folder data/chunks --chunk_size 800 --chunk_overlap 150
 """
 
+from __future__ import annotations
+
 import argparse
+
 import json
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field, field_validator
 
+from core.constants import (
+    ContentType,
+    TABLE_METADATA_KEYS,
+    VISUAL_CONTENT_TYPES,
+    VISUAL_METADATA_KEYS,
+)
+from config import (
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    MIN_SECTION_CHARS,
+)
 from utilities import save_json
 
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    class RecursiveCharacterTextSplitter:
+        """Fallback splitter used when langchain-text-splitters is not installed."""
 
-# CONFIG
+        def __init__(self, chunk_size: int, chunk_overlap: int, separators=None):
+            self.chunk_size = chunk_size
+            self.chunk_overlap = chunk_overlap
+            self.separators = separators or ["\n\n", "\n", ". ", " ", ""]
 
+        def split_text(self, text: str) -> list[str]:
+            text = text or ""
+
+            if len(text) <= self.chunk_size:
+                return [text]
+
+            chunks = []
+            start = 0
+
+            while start < len(text):
+                end = min(start + self.chunk_size, len(text))
+                window = text[start:end]
+
+                if end < len(text):
+                    split_positions = [
+                        window.rfind(separator)
+                        for separator in self.separators
+                        if separator
+                    ]
+                    split_at = max(split_positions) if split_positions else -1
+
+                    if split_at > self.chunk_size * 0.5:
+                        end = start + split_at
+                        window = text[start:end]
+
+                chunks.append(window.strip())
+
+                if end >= len(text):
+                    break
+
+                start = max(end - self.chunk_overlap, start + 1)
+
+            return [chunk for chunk in chunks if chunk]
+
+
+# =========================================================
+# Config
+# =========================================================
 
 class ChunkConfig(BaseModel):
     combined_json: Path
     output_folder: Path
-    chunk_size: int = Field(default=1000, gt=100)
-    chunk_overlap: int = Field(default=200, ge=0)
-    min_section_chars: int = Field(default=60, ge=0)
+    chunk_size: int = Field(default=CHUNK_SIZE, gt=100)
+    chunk_overlap: int = Field(default=CHUNK_OVERLAP, ge=0)
+    min_section_chars: int = Field(default=MIN_SECTION_CHARS, ge=0)
 
     @field_validator("combined_json")
-    def file_must_exist(cls, v):
-        if not v.exists():
-            raise ValueError(f"Combined JSON not found: {v}")
-        return v
-
+    @classmethod
+    def file_must_exist(cls, value: Path) -> Path:
+        if not value.exists():
+            raise ValueError(f"Combined JSON not found: {value}")
+        return value
 
 def parse_args() -> ChunkConfig:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Create text + artifact chunks")
     parser.add_argument("--combined_json", type=str, required=True)
     parser.add_argument("--output_folder", type=str, required=True)
-    parser.add_argument("--chunk_size", type=int, default=1000)
-    parser.add_argument("--chunk_overlap", type=int, default=200)
-    parser.add_argument("--min_section_chars", type=int, default=60)
+    parser.add_argument("--chunk_size", type=int, default=CHUNK_SIZE)
+    parser.add_argument("--chunk_overlap", type=int, default=CHUNK_OVERLAP)
+    parser.add_argument("--min_section_chars", type=int, default=MIN_SECTION_CHARS)
 
     args = parser.parse_args()
 
@@ -50,8 +118,9 @@ def parse_args() -> ChunkConfig:
     )
 
 
-# HEADER PATTERNS
-
+# =========================================================
+# Section detection
+# =========================================================
 
 _RE_APPENDIX_SUB = re.compile(r"^[A-Z]\.\d+(?:\.\d+)?\s+[A-Z]")
 _RE_NUMBERED_SECTION = re.compile(r"^(?:\d+\.?|\d+\.\d+\.?)\s+[A-Z][a-zA-Z]")
@@ -65,159 +134,153 @@ _KNOWN_SECTION_NAMES = re.compile(
     re.IGNORECASE,
 )
 
-
-# SAFETY FILTERS
-
-
-_RE_AUTHOR_LINE = re.compile(r"(university|institute|department|laboratory|\binc\b|\bltd\b)", re.I)
+_RE_AUTHOR_LINE = re.compile(
+    r"(university|institute|department|laboratory|\binc\b|\bltd\b)",
+    re.IGNORECASE,
+)
 _RE_CITATION = re.compile(r"\[\d+\]|\(\w[\w\s]+,\s*\d{4}\)")
-_RE_URL = re.compile(r"https?://|www\.", re.I)
-_RE_EMAIL = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", re.I)
+_RE_URL = re.compile(r"https?://|www\.", re.IGNORECASE)
+_RE_EMAIL = re.compile(
+    r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}",
+    re.IGNORECASE,
+)
+_RE_DOI = re.compile(r"\bdoi\s*:?\s*10\.\d{4,}", re.IGNORECASE)
+_RE_COPYRIGHT = re.compile(r"©|Copyright|All rights reserved", re.IGNORECASE)
+_RE_PAGE_NUM = re.compile(r"^\s*(Page\s*)?\d{1,4}\s*$", re.IGNORECASE)
+_RE_LONE_SECTION_NUM = re.compile(r"^(?:\d+|[A-Z]|\d+\.\d+)$")
 
 
-def _is_hard_rejected(t: str) -> bool:
-    if not t or len(t) < 2:
+def is_noise_line(text: str) -> bool:
+    text = text.strip()
+
+    if not text or len(text) < 4:
         return True
-    if len(t) > 90:
+    if _RE_URL.search(text):
         return True
-    if t.count(",") > 3:
+    if _RE_EMAIL.search(text):
         return True
-    if _RE_AUTHOR_LINE.search(t):
+    if _RE_DOI.search(text):
         return True
-    if _RE_CITATION.search(t):
+    if _RE_COPYRIGHT.search(text):
         return True
-    if _RE_URL.search(t):
+    if _RE_PAGE_NUM.match(text):
         return True
-    if _RE_EMAIL.search(t):
+    if sum(char.isalpha() for char in text) < 3:
         return True
-    if not any(c.isalpha() for c in t):
-        return True
+
     return False
 
 
-def _looks_like_sentence_fragment(t: str) -> bool:
-    words = t.split()
+def is_hard_rejected_header(text: str) -> bool:
+    text = text.strip()
+
+    if not text or len(text) < 2:
+        return True
+    if len(text) > 90:
+        return True
+    if text.count(",") > 3:
+        return True
+    if _RE_AUTHOR_LINE.search(text):
+        return True
+    if _RE_CITATION.search(text):
+        return True
+    if _RE_URL.search(text):
+        return True
+    if _RE_EMAIL.search(text):
+        return True
+    if not any(char.isalpha() for char in text):
+        return True
+
+    return False
+
+
+def looks_like_sentence_fragment(text: str) -> bool:
+    words = text.split()
 
     if len(words) > 12:
         return True
     if words and words[0][0].islower():
         return True
-    if t.endswith(","):
+    if text.endswith(","):
         return True
 
     return False
 
 
-# HEADER CLASSIFICATION (FIXED)
+def classify_header(line: str) -> Optional[str]:
+    text = line.strip()
 
-
-def _classify_header(line: str) -> Optional[str]:
-    t = line.strip()
-
-    if _is_hard_rejected(t):
+    if is_hard_rejected_header(text):
         return None
 
-    if _looks_like_sentence_fragment(t):
+    if looks_like_sentence_fragment(text):
         return None
 
     score = 0
 
-    if _RE_APPENDIX_SUB.match(t):
+    if _RE_APPENDIX_SUB.match(text):
         score += 4
-    if _RE_NUMBERED_SECTION.match(t):
+    if _RE_NUMBERED_SECTION.match(text):
         score += 3
-    if _RE_ROMAN.match(t):
+    if _RE_ROMAN.match(text):
         score += 3
-    if _KNOWN_SECTION_NAMES.match(t):
+    if _KNOWN_SECTION_NAMES.match(text):
         score += 3
-
-    if t.istitle():
+    if text.istitle():
         score += 1
-    if len(t.split()) <= 6:
+    if len(text.split()) <= 6:
         score += 1
-    if not t.endswith("."):
+    if not text.endswith("."):
         score += 1
 
-    return t if score >= 4 else None
+    return text if score >= 4 else None
 
 
-# NOISE FILTER
-
-
-_RE_DOI = re.compile(r"\bdoi\s*:?\s*10\.\d{4,}", re.I)
-_RE_COPYRIGHT = re.compile(r"©|Copyright|All rights reserved", re.I)
-_RE_PAGE_NUM = re.compile(r"^\s*(Page\s*)?\d{1,4}\s*$", re.I)
-
-
-def is_noise_line(text: str) -> bool:
-    t = text.strip()
-
-    if not t or len(t) < 4:
-        return True
-    if _RE_URL.search(t):
-        return True
-    if _RE_EMAIL.search(t):
-        return True
-    if _RE_DOI.search(t):
-        return True
-    if _RE_COPYRIGHT.search(t):
-        return True
-    if _RE_PAGE_NUM.match(t):
-        return True
-    if sum(c.isalpha() for c in t) < 3:
-        return True
-
-    return False
-
-
-# HEADER MERGING FIX
-
-_RE_LONE_SECTION_NUM = re.compile(r"^(?:\d+|[A-Z]|\d+\.\d+)$")
-
-
-def _merge_split_headers(lines: List[str]) -> List[str]:
+def merge_split_headers(lines: list[str]) -> list[str]:
     result = []
-    i = 0
+    index = 0
 
-    while i < len(lines):
-        cur = lines[i].strip()
-        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+    while index < len(lines):
+        current = lines[index].strip()
+        next_line = lines[index + 1].strip() if index + 1 < len(lines) else ""
 
-        is_lone = bool(_RE_LONE_SECTION_NUM.match(cur))
-        next_is_header = bool(_KNOWN_SECTION_NAMES.match(nxt) or _RE_APPENDIX_SUB.match(nxt))
+        is_lone = bool(_RE_LONE_SECTION_NUM.match(current))
+        next_is_header = bool(
+            _KNOWN_SECTION_NAMES.match(next_line)
+            or _RE_APPENDIX_SUB.match(next_line)
+        )
 
         if is_lone and next_is_header:
-            result.append(cur + " " + nxt)
-            i += 2
+            result.append(current + " " + next_line)
+            index += 2
         else:
-            result.append(lines[i])
-            i += 1
+            result.append(lines[index])
+            index += 1
 
     return result
 
 
-# SECTION SPLITTER
-
-
-def split_into_sections(full_text: str) -> List[Dict[str, str]]:
-    raw_lines = full_text.split("\n")
-
-    # FIX: merge first, THEN filter
-    raw_lines = _merge_split_headers(raw_lines)
-    lines = [l.rstrip() for l in raw_lines if not is_noise_line(l)]
+def split_into_sections(full_text: str) -> list[dict[str, str]]:
+    raw_lines = merge_split_headers(full_text.split("\n"))
+    lines = [line.rstrip() for line in raw_lines if not is_noise_line(line)]
 
     sections = []
     current_header = "Body"
     current_body = []
 
-    def flush():
+    def flush() -> None:
         text = "\n".join(current_body).strip()
         if text:
-            sections.append({"section": current_header, "text": text})
+            sections.append(
+                {
+                    "section": current_header,
+                    "text": text,
+                }
+            )
         current_body.clear()
 
     for line in lines:
-        header = _classify_header(line)
+        header = classify_header(line)
 
         if header:
             flush()
@@ -235,36 +298,34 @@ def split_into_sections(full_text: str) -> List[Dict[str, str]]:
     return sections
 
 
-
-# ACCUMULATE DOCUMENT
-
-
-def accumulate_sections(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def accumulate_sections(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     accumulated = []
     current_label = None
     current_parts = []
     page_start = None
     page_end = None
 
-    def flush():
+    def flush() -> None:
         if current_label and current_parts:
-            accumulated.append({
-                "section": current_label,
-                "text": "\n".join(current_parts).strip(),
-                "page_start": page_start,
-                "page_end": page_end,
-            })
+            accumulated.append(
+                {
+                    "section": current_label,
+                    "text": "\n".join(current_parts).strip(),
+                    "page_start": page_start,
+                    "page_end": page_end,
+                }
+            )
 
     for page in pages:
-        pnum = page.get("page_number", "?")
+        page_number = page.get("page_number", "?")
         text = page.get("text", "")
 
         if not text.strip():
             continue
 
-        for sec in split_into_sections(text):
-            label = sec["section"]
-            body = sec["text"]
+        for section in split_into_sections(text):
+            label = section["section"]
+            body = section["text"]
 
             if label == current_label:
                 current_parts.append(body)
@@ -272,23 +333,199 @@ def accumulate_sections(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 flush()
                 current_label = label
                 current_parts = [body]
-                page_start = pnum
+                page_start = page_number
 
-            page_end = pnum
+            page_end = page_number
 
     flush()
     return accumulated
 
 
+# =========================================================
+# Chunk helper functions
+# =========================================================
 
-# CHUNKING PIPELINE
+def compact_value(value: Any) -> str:
+    if value is None:
+        return ""
 
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+
+    return str(value)
+
+
+def clean_metadata(metadata: dict[str, Any]) -> dict[str, str]:
+    return {
+        key: compact_value(value)
+        for key, value in metadata.items()
+        if value is not None
+    }
+
+
+def build_table_embedding_text(table: dict[str, Any]) -> str:
+    columns = table.get("columns") or []
+    rows = table.get("rows") or []
+    markdown = table.get("markdown") or ""
+
+    if not markdown and rows:
+        markdown = json.dumps(rows[:20], ensure_ascii=False)
+
+    vision_description = table.get("vision_description", "") or ""
+    vision_markdown = table.get("vision_markdown", "") or ""
+
+    return f"""Content type: table
+Paper: {table.get('paper_name', '')}
+Section: {table.get('section', '')}
+Page: {table.get('page_number', '')}
+Caption: {table.get('caption', '')}
+Columns: {', '.join(str(column) for column in columns)}
+Markdown table:
+{markdown}
+
+Vision description:
+{vision_description}
+
+Vision markdown:
+{vision_markdown}
+
+CSV path: {table.get('csv_path', '')}
+HTML path: {table.get('html_path', '')}
+JSON path: {table.get('json_path', '')}
+Image path: {table.get('image_path', '')}
+Structured status: {table.get('structured_status', '')}
+Display preference: {table.get('display_preference', '')}
+Quality reason: {table.get('quality_reason', '')}
+Extraction method: {table.get('extraction_method', '')}
+Extraction confidence: {table.get('extraction_confidence', '')}
+Vision status: {table.get('vision_status', '')}
+Vision model: {table.get('vision_model', '')}
+""".strip()
+
+
+def build_visual_embedding_text(visual: dict[str, Any]) -> str:
+    content_type = visual.get("content_type", ContentType.FIGURE.value)
+    description = visual.get("vision_description") or visual.get("description", "")
+
+    return f"""Content type: {content_type}
+Paper: {visual.get('paper_name', '')}
+Section: {visual.get('section', '')}
+Page: {visual.get('page_number', '')}
+Caption: {visual.get('caption', '')}
+Description:
+{description}
+Image path: {visual.get('image_path', '')}
+Mermaid status: {visual.get('mermaid_status', '')}
+Mermaid:
+{visual.get('mermaid', '')}
+Extraction method: {visual.get('extraction_method', '')}
+Extraction confidence: {visual.get('extraction_confidence', '')}
+Vision status: {visual.get('vision_status', '')}
+Vision model: {visual.get('vision_model', '')}
+""".strip()
+
+
+def build_table_metadata(table: dict[str, Any]) -> dict[str, str]:
+    return clean_metadata(
+        {
+            key: table.get(key, "")
+            for key in TABLE_METADATA_KEYS
+        }
+    )
+
+
+def build_visual_metadata(visual: dict[str, Any]) -> dict[str, str]:
+    return clean_metadata(
+        {
+            key: visual.get(key, "")
+            for key in VISUAL_METADATA_KEYS
+        }
+    )
+
+
+def make_table_chunk(
+    chunk_id: int,
+    paper: dict[str, Any],
+    table: dict[str, Any],
+) -> dict[str, Any]:
+    page_number = table.get("page_number", "")
+    table = {
+        **table,
+        "paper_name": table.get("paper_name") or paper.get("paper_name", "unknown"),
+        "author": paper.get("author", "Unknown"),
+        "year": paper.get("year", "Unknown"),
+        "source_file": table.get("source_file") or paper.get("source_file", ""),
+        "page_start": page_number,
+        "page_end": page_number,
+    }
+
+    embedding_text = build_table_embedding_text(table)
+    metadata = build_table_metadata(table)
+
+    return {
+        "chunk_id": chunk_id,
+        "content_type": ContentType.TABLE.value,
+        "paper_name": table.get("paper_name", "unknown"),
+        "author": table.get("author", "Unknown"),
+        "year": table.get("year", "Unknown"),
+        "source_file": table.get("source_file", ""),
+        "section": table.get("section", "Unknown"),
+        "text": embedding_text,
+        "embedding_text": embedding_text,
+        "char_count": len(embedding_text),
+        "page_start": page_number,
+        "page_end": page_number,
+        "metadata": metadata,
+    }
+
+
+def make_visual_chunk(
+    chunk_id: int,
+    paper: dict[str, Any],
+    visual: dict[str, Any],
+) -> dict[str, Any]:
+    page_number = visual.get("page_number", "")
+    content_type = visual.get("content_type", ContentType.FIGURE.value)
+
+    visual = {
+        **visual,
+        "paper_name": visual.get("paper_name") or paper.get("paper_name", "unknown"),
+        "author": paper.get("author", "Unknown"),
+        "year": paper.get("year", "Unknown"),
+        "source_file": visual.get("source_file") or paper.get("source_file", ""),
+        "page_start": page_number,
+        "page_end": page_number,
+    }
+
+    embedding_text = build_visual_embedding_text(visual)
+    metadata = build_visual_metadata(visual)
+
+    return {
+        "chunk_id": chunk_id,
+        "content_type": content_type,
+        "paper_name": visual.get("paper_name", "unknown"),
+        "author": visual.get("author", "Unknown"),
+        "year": visual.get("year", "Unknown"),
+        "source_file": visual.get("source_file", ""),
+        "section": visual.get("section", "Unknown"),
+        "text": embedding_text,
+        "embedding_text": embedding_text,
+        "char_count": len(embedding_text),
+        "page_start": page_number,
+        "page_end": page_number,
+        "metadata": metadata,
+    }
+
+
+# =========================================================
+# Pipeline
+# =========================================================
 
 def chunk_papers(config: ChunkConfig) -> Path:
     config.output_folder.mkdir(parents=True, exist_ok=True)
 
-    with open(config.combined_json, "r", encoding="utf-8") as f:
-        papers = json.load(f)
+    with config.combined_json.open("r", encoding="utf-8") as file:
+        papers = json.load(file)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.chunk_size,
@@ -304,56 +541,91 @@ def chunk_papers(config: ChunkConfig) -> Path:
         paper_author = paper.get("author", "Unknown")
         paper_year = paper.get("year", "Unknown")
         paper_source_file = paper.get("source_file", "")
-        pages = paper.get("pages", [])
+        pages = paper.get("pages", []) or []
 
         print(f"\n{paper_name} ({len(pages)} pages)")
 
         doc_sections = accumulate_sections(pages)
-        summary = {}
+        section_summary: dict[str, int] = {}
 
-        for sec in doc_sections:
-            label = sec["section"]
-            body = sec["text"]
+        for section in doc_sections:
+            label = section["section"]
+            body = section["text"]
 
             if len(body) < config.min_section_chars:
                 continue
 
             for part in splitter.split_text(body):
                 part = part.strip()
+
                 if len(part) < 50:
                     continue
 
-                all_chunks.append({
-                    "chunk_id": chunk_id,
-                    "paper_name": paper_name,
-                    "author": paper_author,
-                    "year": paper_year,
-                    "source_file": paper_source_file,
-                    "section": label,
-                    "text": part,
-                    "char_count": len(part),
-                    "page_start": sec["page_start"],
-                    "page_end": sec["page_end"],
-                })
+                metadata = clean_metadata(
+                    {
+                        "content_type": ContentType.TEXT.value,
+                        "paper_name": paper_name,
+                        "author": paper_author,
+                        "year": paper_year,
+                        "section": label,
+                        "page_start": section["page_start"],
+                        "page_end": section["page_end"],
+                        "source_file": paper_source_file,
+                    }
+                )
+
+                all_chunks.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "content_type": ContentType.TEXT.value,
+                        "paper_name": paper_name,
+                        "author": paper_author,
+                        "year": paper_year,
+                        "source_file": paper_source_file,
+                        "section": label,
+                        "text": part,
+                        "embedding_text": part,
+                        "char_count": len(part),
+                        "page_start": section["page_start"],
+                        "page_end": section["page_end"],
+                        "metadata": metadata,
+                    }
+                )
 
                 chunk_id += 1
-                summary[label] = summary.get(label, 0) + 1
+                section_summary[label] = section_summary.get(label, 0) + 1
 
-        print("Sections:", summary)
+        table_count = 0
+        for table in paper.get("tables", []) or []:
+            all_chunks.append(make_table_chunk(chunk_id, paper, table))
+            chunk_id += 1
+            table_count += 1
+
+        visual_counts: dict[str, int] = {}
+        for visual in paper.get("figures", []) or []:
+            content_type = visual.get("content_type", ContentType.FIGURE.value)
+
+            if content_type not in VISUAL_CONTENT_TYPES:
+                content_type = ContentType.FIGURE.value
+                visual["content_type"] = content_type
+
+            all_chunks.append(make_visual_chunk(chunk_id, paper, visual))
+            chunk_id += 1
+            visual_counts[content_type] = visual_counts.get(content_type, 0) + 1
+
+        print("Text sections:", section_summary)
+        print(f"Artifact chunks: tables={table_count}, visuals={visual_counts}")
 
     output_path = config.output_folder / "chunks.json"
-
     save_json(all_chunks, output_path)
 
     print(f"\nSaved: {output_path}")
+    print(f"Total chunks: {len(all_chunks)}")
+
     return output_path
 
 
-
-# MAIN
-
-
 if __name__ == "__main__":
-    cfg = parse_args()
-    print("CONFIG:", cfg)
-    chunk_papers(cfg)
+    config = parse_args()
+    print("CONFIG:", config)
+    chunk_papers(config)

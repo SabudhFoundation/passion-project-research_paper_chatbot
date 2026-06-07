@@ -1,37 +1,36 @@
 """
 embedding.py
 
-Generates embeddings from a chunks JSON file and stores them in ChromaDB.
-python src/embedding.py --chunk_file data/chunks/chunks.json --vector_folder data/vector_store --reset
+Generates embeddings from chunks.json and stores them in ChromaDB.
 
+Supports typed multimodal chunks by embedding:
+- chunk["embedding_text"] if present
+- otherwise chunk["text"]
+
+Run:
+python src/embedding.py --chunk_file data/chunks/chunks.json --vector_folder data/vector_store --reset
 """
 
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
 import time
-import hashlib
-import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List
 
-import numpy as np
 import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+import numpy as np
 from pydantic import BaseModel, Field, field_validator
+from sentence_transformers import SentenceTransformer
+from config import COLLECTION_NAME
 
-
-
-# CONSTANTS
-
-
-COLLECTION_NAME = "pdf_chunks"
-
-# The only supported distance metric.
-# ChromaDB key: hnsw:space   Interpretation: similarity = 1 - distance
 DISTANCE_METRIC = "cosine"
 
+_META_MODEL = "embedding_model"
+_META_METRIC = "distance_metric"
 
-# CONFIG
 
 class EmbedConfig(BaseModel):
     chunk_file: Path
@@ -41,40 +40,30 @@ class EmbedConfig(BaseModel):
     reset: bool = False
 
     @field_validator("chunk_file")
-    def file_must_exist(cls, v):
-        if not v.exists():
-            raise ValueError(f"Chunk file not found: {v}")
-        return v
-
-
-# ARG PARSER
+    @classmethod
+    def file_must_exist(cls, value: Path) -> Path:
+        if not value.exists():
+            raise ValueError(f"Chunk file not found: {value}")
+        return value
 
 
 def parse_args() -> EmbedConfig:
     parser = argparse.ArgumentParser(
         description="Generate embeddings and store in ChromaDB",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # First run or incremental update (safe to repeat):
-  python embedding.py --chunk_file chunks.json --vector_folder ./db
-
-  # Switch to a new embedding model (wipes and rebuilds the collection):
-  python embedding.py --chunk_file chunks.json --vector_folder ./db \\
-      --model_name all-mpnet-base-v2 --reset
-        """,
     )
-    parser.add_argument("--chunk_file",    type=str, required=True)
+
+    parser.add_argument("--chunk_file", type=str, required=True)
     parser.add_argument("--vector_folder", type=str, required=True)
-    parser.add_argument("--model_name",    type=str, default="all-MiniLM-L6-v2")
-    parser.add_argument("--batch_size",    type=int, default=64)
+    parser.add_argument("--model_name", type=str, default="all-MiniLM-L6-v2")
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Delete and rebuild the collection from scratch. "
-             "Required when changing --model_name.",
+        help="Delete and rebuild the Chroma collection from scratch.",
     )
+
     args = parser.parse_args()
+
     return EmbedConfig(
         chunk_file=Path(args.chunk_file),
         vector_folder=Path(args.vector_folder),
@@ -83,29 +72,91 @@ Examples:
         reset=args.reset,
     )
 
-# STABLE CHUNK ID 
+
+def embedding_text_for_chunk(chunk: Dict[str, Any]) -> str:
+    """
+    Prefer explicit embedding_text, then fallback to text.
+    """
+    return str(chunk.get("embedding_text") or chunk.get("text") or "").strip()
 
 
-def stable_chunk_id(chunk: Dict[str, Any], idx: int) -> str:
+def stable_chunk_id(chunk: Dict[str, Any], index: int) -> str:
+    """
+    Stable ID based on chunk identity and content.
+    """
+    metadata = chunk.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
     identity = (
-        f"{chunk.get('paper_name','')}::"
-        f"{chunk.get('section','')}::"
-        f"{chunk.get('page_start','')}::"
-        f"{chunk.get('text','')}::"
-        f"{idx}"
+        f"{chunk.get('content_type', 'text')}::"
+        f"{chunk.get('paper_name', '')}::"
+        f"{chunk.get('section', '')}::"
+        f"{chunk.get('page_start', '')}::"
+        f"{chunk.get('page_end', '')}::"
+        f"{metadata.get('table_id', '')}::"
+        f"{metadata.get('figure_id', '')}::"
+        f"{embedding_text_for_chunk(chunk)}::"
+        f"{index}"
     )
+
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-# EMBEDDING MANAGER
+def scalar_metadata_value(value: Any) -> str:
+    """
+    Chroma metadata supports scalar values.
+    Stringify lists/dicts safely.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, ensure_ascii=False)
+
+    return str(value)
+
+
+def metadata_for_chunk(chunk: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Merge chunk metadata with top-level fields.
+    """
+    metadata: Dict[str, Any] = {}
+
+    if isinstance(chunk.get("metadata"), dict):
+        metadata.update(chunk["metadata"])
+
+    for key in [
+        "content_type",
+        "paper_name",
+        "author",
+        "year",
+        "section",
+        "page_start",
+        "page_end",
+        "source_file",
+    ]:
+        metadata.setdefault(key, chunk.get(key, ""))
+
+    metadata["distance_metric"] = DISTANCE_METRIC
+    metadata["similarity_formula"] = "1 - cosine_distance"
+
+    return {
+        str(key): scalar_metadata_value(value)
+        for key, value in metadata.items()
+        if value is not None
+    }
+
 
 class EmbeddingManager:
     def __init__(self, model_name: str):
         self.model_name = model_name
-        print(f"Loading embedding model: {model_name}", flush=True)
+
+        print(f"[embedding] Loading embedding model: {model_name}", flush=True)
         self.model = SentenceTransformer(model_name)
-        self.dim = self.model.get_sentence_embedding_dimension()
-        print(f"Embedding dimension : {self.dim}", flush=True)
+
+        self.dimension = self.model.get_sentence_embedding_dimension()
+        print(f"[embedding] Embedding dimension: {self.dimension}", flush=True)
 
     def generate(self, texts: List[str], batch_size: int) -> np.ndarray:
         return self.model.encode(
@@ -113,147 +164,87 @@ class EmbeddingManager:
             batch_size=batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
-            normalize_embeddings=True,   # required for cosine via dot-product
+            normalize_embeddings=True,
         )
-
-
-# VECTOR STORE  
-
-
-# Metadata keys written into the ChromaDB collection
-_META_MODEL  = "embedding_model"
-_META_METRIC = "distance_metric"
 
 
 class VectorStore:
     """
-    Wraps a ChromaDB persistent collection with:
-      - Enforced embedding model consistency  (Issue 6)
-      - Enforced distance metric consistency  (Issue 7)
-      - Content-addressed upsert (no duplicates) (Issue 5)
-
-    Similarity score interpretation
-    ────────────────────────────────
-    ChromaDB returns distances, not similarities.
-    With distance_metric = "cosine":
-        cosine_distance = 1 - cosine_similarity
-        cosine_similarity = 1 - cosine_distance
-        Range: distance ∈ [0, 2], similarity ∈ [-1, 1]
-        Higher similarity → more relevant.
-    Always use: similarity = 1 - result["distances"][0][i]
+    Small ChromaDB wrapper with collection metadata validation.
     """
 
     def __init__(self, persist_dir: Path, model_name: str, reset: bool):
         persist_dir.mkdir(parents=True, exist_ok=True)
-        self.model_name = model_name
 
+        self.model_name = model_name
         self.client = chromadb.PersistentClient(path=str(persist_dir))
-        self.max_batch_size = self._resolve_max_batch_size()
+        self.max_batch_size = self.resolve_max_batch_size()
 
         if reset:
-            self._drop_collection()
+            self.drop_collection()
 
-        self.collection = self._open_or_create_collection()
-        self._validate_collection_metadata()
+        self.collection = self.open_or_create_collection()
+        self.validate_collection_metadata()
 
-        print(f"Collection '{COLLECTION_NAME}' ready.", flush=True)
-        print(f"  Embedding model : {model_name}", flush=True)
-        print(f"  Distance metric : {DISTANCE_METRIC}  (similarity = 1 - distance)", flush=True)
-        print(f"  Max batch size  : {self.max_batch_size}", flush=True)
-        print(f"  Existing vectors: {self.collection.count()}", flush=True)
+        print(f"[vector] Collection '{COLLECTION_NAME}' ready.", flush=True)
+        print(f"[vector] Embedding model: {model_name}", flush=True)
+        print(f"[vector] Distance metric: {DISTANCE_METRIC}", flush=True)
+        print(f"[vector] Existing vectors: {self.collection.count()}", flush=True)
 
-    # ── private helpers ────────────────────────────────────────────────
-
-    def _drop_collection(self) -> None:
-        try:
-            self.client.delete_collection(COLLECTION_NAME)
-            print(f"Existing collection '{COLLECTION_NAME}' deleted (--reset).")
-        except Exception:
-            pass  # collection did not exist yet
-
-    def _resolve_max_batch_size(self) -> int:
-        """
-        Prefer the batch limit reported by the installed Chroma client.
-        Fall back to the observed safe default if the API is unavailable.
-        """
-        candidate = getattr(self.client, "get_max_batch_size", None)
-        if callable(candidate):
+    def resolve_max_batch_size(self) -> int:
+        getter = getattr(self.client, "get_max_batch_size", None)
+        if callable(getter):
             try:
-                value = int(candidate())
+                value = int(getter())
                 if value > 0:
                     return value
             except Exception:
                 pass
 
-        candidate = getattr(self.client, "max_batch_size", None)
-        if isinstance(candidate, int) and candidate > 0:
-            return candidate
+        value = getattr(self.client, "max_batch_size", None)
+        if isinstance(value, int) and value > 0:
+            return value
 
         return 5461
 
-    def _open_or_create_collection(self):
-        """
-        Always open with get_or_create_collection.
+    def drop_collection(self) -> None:
+        try:
+            self.client.delete_collection(COLLECTION_NAME)
+            print(f"[vector] Deleted existing collection '{COLLECTION_NAME}'.")
+        except Exception:
+            pass
 
-        IMPORTANT: the metadata dict is only written on CREATION.
-        On subsequent opens ChromaDB silently ignores the metadata
-        argument — that is why we validate separately in
-        _validate_collection_metadata().
-        """
+    def open_or_create_collection(self):
         return self.client.get_or_create_collection(
             name=COLLECTION_NAME,
             metadata={
-                _META_MODEL:  self.model_name,
+                _META_MODEL: self.model_name,
                 _META_METRIC: DISTANCE_METRIC,
-                "hnsw:space": DISTANCE_METRIC,   # ChromaDB internal key
+                "hnsw:space": DISTANCE_METRIC,
             },
         )
 
-    def _validate_collection_metadata(self) -> None:
-        """
-        Read the metadata that is actually stored on disk and compare
-        against what we expect. Raises ValueError on any mismatch so the
-        user knows to pass --reset rather than silently poisoning the DB.
+    def validate_collection_metadata(self) -> None:
+        stored = self.collection.metadata or {}
 
-        This is the correct fix for Issues 6 and 7: we cannot trust the
-        metadata argument to get_or_create_collection on re-opens, so we
-        always validate after opening.
-        """
-        stored: Dict[str, Any] = self.collection.metadata or {}
-
-        stored_model  = stored.get(_META_MODEL)
+        stored_model = stored.get(_META_MODEL)
         stored_metric = stored.get(_META_METRIC)
 
-        # Validate model
         if stored_model and stored_model != self.model_name:
             raise ValueError(
-                f"\n[Issue 6] Embedding model mismatch — cannot safely add vectors.\n"
-                f"  Stored in collection : {stored_model}\n"
-                f"  Requested now        : {self.model_name}\n"
-                f"  → Re-run with --reset to rebuild the collection with the new model."
+                "Embedding model mismatch. "
+                f"Stored={stored_model}, requested={self.model_name}. "
+                "Run again with --reset."
             )
 
-        # Validate metric
         if stored_metric and stored_metric != DISTANCE_METRIC:
             raise ValueError(
-                f"\n[Issue 7] Distance metric mismatch — similarity scores would be wrong.\n"
-                f"  Stored in collection : {stored_metric}\n"
-                f"  Expected             : {DISTANCE_METRIC}\n"
-                f"  → Re-run with --reset to rebuild the collection."
+                "Distance metric mismatch. "
+                f"Stored={stored_metric}, expected={DISTANCE_METRIC}. "
+                "Run again with --reset."
             )
 
-    # ── public API ─────────────────────────────────────────────────────
-
     def upsert(self, chunks: List[Dict[str, Any]], embeddings: np.ndarray) -> Dict[str, int]:
-        """
-        Insert or update chunks using content-addressed IDs.
-
-        Returns a summary dict with keys: total_submitted, upserted.
-        ChromaDB upsert semantics:
-          - New ID   → inserted as a new vector.
-          - Known ID → the document, embedding, and metadata are updated.
-          - Unchanged text → same ID → update is a no-op at the storage level.
-        """
         if len(chunks) != len(embeddings):
             raise ValueError(
                 f"Chunk count ({len(chunks)}) does not match embedding count ({len(embeddings)})."
@@ -264,74 +255,73 @@ class VectorStore:
         for start in range(0, len(chunks), self.max_batch_size):
             end = min(start + self.max_batch_size, len(chunks))
 
-            ids:  List[str]         = []
-            docs: List[str]         = []
-            embs: List[List[float]] = []
-            metas: List[Dict]       = []
+            ids: List[str] = []
+            documents: List[str] = []
+            embedding_values: List[List[float]] = []
+            metadatas: List[Dict[str, str]] = []
 
-            for i in range(start, end):
-                chunk = chunks[i]
-                emb = embeddings[i]
+            for index in range(start, end):
+                chunk = chunks[index]
+                text = embedding_text_for_chunk(chunk)
 
-                ids.append(stable_chunk_id(chunk, i))
-                docs.append(chunk["text"])
-                embs.append(emb.tolist())
-                metas.append({
-                    "paper_name":  str(chunk.get("paper_name",  "") or ""),
-                    "author":      str(chunk.get("author",      "") or ""),
-                    "year":        str(chunk.get("year",        "") or ""),
-                    "section":     str(chunk.get("section",     "") or ""),
-                    "page_start":  str(chunk.get("page_start",  "") or ""),
-                    "page_end":    str(chunk.get("page_end",    "") or ""),
-                    "source_file": str(chunk.get("source_file", "") or ""),
-                    # Store similarity interpretation alongside data
-                    "distance_metric": DISTANCE_METRIC,
-                    "similarity_formula": "1 - cosine_distance",
-                })
+                if not text:
+                    continue
+
+                ids.append(stable_chunk_id(chunk, index))
+                documents.append(text)
+                embedding_values.append(embeddings[index].tolist())
+                metadatas.append(metadata_for_chunk(chunk))
+
+            if not ids:
+                continue
 
             self.collection.upsert(
                 ids=ids,
-                documents=docs,
-                embeddings=embs,
-                metadatas=metas,
+                documents=documents,
+                embeddings=embedding_values,
+                metadatas=metadatas,
             )
+
             submitted += len(ids)
 
-        after_count = self.collection.count()
         return {
             "total_submitted": submitted,
-            "collection_size": after_count,
+            "collection_size": self.collection.count(),
         }
 
 
-
-# MAIN
-
-
 def run_embedding(config: EmbedConfig) -> None:
-    start = time.time()
+    start_time = time.time()
 
-    print("[START] embedding pipeline initializing...", flush=True)
+    print("[START] Embedding pipeline initializing...", flush=True)
+    print(f"[LOAD] Reading chunks from {config.chunk_file}", flush=True)
 
-    # ── Load chunks ───────────────────────────────────────────────────
-    print(f"[LOAD] Reading chunks from {config.chunk_file}...", flush=True)
-    with open(config.chunk_file, "r", encoding="utf-8") as f:
-        chunks: List[Dict[str, Any]] = json.load(f)
+    with config.chunk_file.open("r", encoding="utf-8") as file:
+        raw_chunks: List[Dict[str, Any]] = json.load(file)
 
-    print(f"Loaded {len(chunks)} chunks from {config.chunk_file}", flush=True)
+    chunks = [
+        chunk
+        for chunk in raw_chunks
+        if embedding_text_for_chunk(chunk)
+    ]
+
+    skipped = len(raw_chunks) - len(chunks)
+
+    print(f"[LOAD] Loaded chunks: {len(raw_chunks)}", flush=True)
+    if skipped:
+        print(f"[LOAD] Skipped empty chunks: {skipped}", flush=True)
 
     if not chunks:
-        print("Nothing to embed. Exiting.", flush=True)
+        print("[DONE] Nothing to embed.", flush=True)
         return
 
-    # ── Generate embeddings ───────────────────────────────────────────
-    print("[EMBED] Loading sentence-transformer model...", flush=True)
     manager = EmbeddingManager(config.model_name)
-    texts = [c["text"] for c in chunks]
-    print(f"[EMBED] Encoding {len(texts)} chunk(s)...", flush=True)
+
+    texts = [embedding_text_for_chunk(chunk) for chunk in chunks]
+
+    print(f"[EMBED] Encoding {len(texts)} chunks...", flush=True)
     embeddings = manager.generate(texts, config.batch_size)
 
-    # ── Store in ChromaDB ─────────────────────────────────────────────
     print("[STORE] Opening vector store...", flush=True)
     store = VectorStore(
         persist_dir=config.vector_folder,
@@ -342,21 +332,18 @@ def run_embedding(config: EmbedConfig) -> None:
     print("[STORE] Writing embeddings to ChromaDB...", flush=True)
     summary = store.upsert(chunks, embeddings)
 
-    # ── Report ────────────────────────────────────────────────────────
-    elapsed = round(time.time() - start, 2)
-    print(f"\n{'─'*50}", flush=True)
-    print(f"  Chunks submitted : {summary['total_submitted']}", flush=True)
-    print(f"  Collection size  : {summary['collection_size']}", flush=True)
-    print(f"  Elapsed          : {elapsed}s", flush=True)
-    print(f"{'─'*50}", flush=True)
-    print(f" Done. Vectors stored at: {config.vector_folder}", flush=True)
+    elapsed = round(time.time() - start_time, 2)
 
-
-
-# ENTRY
+    print()
+    print("─" * 50)
+    print(f"Chunks submitted : {summary['total_submitted']}")
+    print(f"Collection size  : {summary['collection_size']}")
+    print(f"Elapsed          : {elapsed}s")
+    print("─" * 50)
+    print(f"Done. Vectors stored at: {config.vector_folder}")
 
 
 if __name__ == "__main__":
-    cfg = parse_args()
-    print("\nCONFIG:", cfg, flush=True)
-    run_embedding(cfg)
+    config = parse_args()
+    print("\nCONFIG:", config, flush=True)
+    run_embedding(config)

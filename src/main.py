@@ -1,59 +1,70 @@
 """
 main.py
-Goal: Orchestrate routing → retrieval → answer generation.
 
-Example:
-    python src/main.py \\
-        --question "What is the Transformer architecture?" \\
-        --model_name  gemini-1.5-flash \\
-        --temperature 0.1 \\
-        --vector_store_path ../data/vector_store \\
-        --output_json_path ../data/results/output.json \\
-        --top_k 3 \\
-        --embed_model Sentence-transformer model (default: all-MiniLM-L6-v2)
+Knowledge Base RAG pipeline:
+- route query
+- retrieve typed chunks
+- generate answer
+- save result + metrics
 
-    python src/main.py --question "write a short note on transformer?" --vector_store_path data/vector_store --output_json_path data/results/output.json
+Supports multimodal RAG context:
+- text chunks
+- table chunks
+- figure / image / diagram / flowchart chunks
+
+Important:
+This file does NOT send images directly to the LLM during normal QA.
+Images are displayed in UI and can be described earlier by vision_describe.py.
 """
+
+from __future__ import annotations
+
 import argparse
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, field_validator
+
 from config import (
+    EMBED_MODEL,
+    MEMORY_WINDOW,
+    METRICS_JSON_PATH,
     MODEL_NAME,
+    OUTPUT_JSON_PATH,
     TEMPERATURE,
     TOP_K,
     VECTOR_STORE_PATH,
-    EMBED_MODEL,
-    OUTPUT_JSON_PATH,
-    MAX_ROUTE_RETRIES,
-    ROUTE_RETRY_DELAY,
-    MEMORY_WINDOW,
-    METRICS_JSON_PATH,
 )
-from dotenv import load_dotenv
-
-from pydantic import BaseModel, Field, field_validator
-
-from llm import (
-    build_llm,
-    normalize_provider_name,
+from llm import build_llm, normalize_provider_name
+from metrics import save_metrics
+from rag_common import (
+    build_empty_generation_metrics,
+    build_overall_from_stage_metrics,
+    classify_route,
+    decide_content_types,
+    format_chunk_for_context,
+    generate_non_rag_answer_with_metrics,
+    generate_rag_answer_with_metrics,
+    serialize_retrieved_chunk,
 )
-from prompt import route_query
 from utilities import error_result, save_result
-from metrics import (
-    Timer,
-    build_stage_metrics,
-    build_overall_metrics,
-    save_metrics,
-)
 
 load_dotenv()
 
-# Simple in-memory conversation buffer
-CONVERSATION_MEMORY = []
 
+# =========================================================
+# Conversation memory
+# =========================================================
+
+CONVERSATION_MEMORY: list[dict[str, Any]] = []
+
+
+# =========================================================
+# CLI config
+# =========================================================
 
 class MainConfig(BaseModel):
     question: str
@@ -63,19 +74,20 @@ class MainConfig(BaseModel):
     vector_store_path: Path = VECTOR_STORE_PATH
     output_json_path: Path = OUTPUT_JSON_PATH
     metrics_json_path: Path = METRICS_JSON_PATH
-    top_k: int = Field(default=TOP_K, gt=0, le=20)
+    top_k: int = Field(default=TOP_K, gt=0, le=30)
     embed_model: str = EMBED_MODEL
 
     @field_validator("vector_store_path")
     @classmethod
-    def folder_must_exist(cls, v: Path) -> Path:
-        if not v.exists():
-            raise ValueError(f"Vector store folder not found: {v}")
-        return v
+    def folder_must_exist(cls, value: Path) -> Path:
+        if not value.exists():
+            raise ValueError(f"Vector store folder not found: {value}")
+        return value
 
 
 def parse_args() -> MainConfig:
-    parser = argparse.ArgumentParser(description="RAG Pipeline — main entry point")
+    parser = argparse.ArgumentParser(description="RAG pipeline main entry point")
+
     parser.add_argument("--question", type=str, required=True)
     parser.add_argument("--model_name", type=str, default=MODEL_NAME)
     parser.add_argument("--provider", type=str, default=None)
@@ -85,6 +97,7 @@ def parse_args() -> MainConfig:
     parser.add_argument("--metrics_json_path", type=str, default=str(METRICS_JSON_PATH))
     parser.add_argument("--top_k", type=int, default=TOP_K)
     parser.add_argument("--embed_model", type=str, default=EMBED_MODEL)
+
     args = parser.parse_args()
 
     return MainConfig(
@@ -100,104 +113,20 @@ def parse_args() -> MainConfig:
     )
 
 
-def _try_parse_route(raw_response: str) -> Optional[str]:
-    cleaned = re.sub(r"```(?:json)?", "", raw_response).replace("```", "").strip()
-    start = cleaned.find("{")
-    if start == -1:
-        return None
-
-    try:
-        parsed, _ = json.JSONDecoder().raw_decode(cleaned[start:])
-    except json.JSONDecodeError:
-        return None
-
-    route = parsed.get("route", "")
-    return route if route in ("rag", "non_rag") else None
-
-
-def classify_route(
-    question: str,
-    llm,
-    provider: str,
-    model_name: str,
-    memory=None,
-):
-    routing_prompt = route_query(question, memory=memory)
-    route_start = time.time()
-    last_api_error: Optional[Exception] = None
-
-    for attempt in range(1, MAX_ROUTE_RETRIES + 1):
-        try:
-            raw_response = llm.generate_content(routing_prompt).text.strip()
-            last_api_error = None
-        except Exception as exc:
-            last_api_error = exc
-            print(
-                f"[main] Router LLM call failed (attempt {attempt}/{MAX_ROUTE_RETRIES}): {exc!r}",
-                flush=True,
-            )
-            if attempt < MAX_ROUTE_RETRIES:
-                time.sleep(ROUTE_RETRY_DELAY)
-            continue
-
-        route = _try_parse_route(raw_response)
-        if route is not None:
-
-            routing_metrics = build_stage_metrics(
-                prompt=routing_prompt,
-                response=raw_response,
-                provider=provider,
-                model_name=model_name,
-                latency=round(time.time() - route_start, 3),
-            )
-
-            print(f"[main] Route decided: '{route}' (attempt {attempt})", flush=True)
-
-            return route, routing_metrics
-
-        print(
-            f"[main] Could not parse a valid route from response "
-            f"(attempt {attempt}/{MAX_ROUTE_RETRIES}): {raw_response!r}",
-            flush=True,
-        )
-        if attempt < MAX_ROUTE_RETRIES:
-            time.sleep(ROUTE_RETRY_DELAY)
-
-    if last_api_error is not None:
-        raise RuntimeError(
-            f"[main] Router LLM call failed after {MAX_ROUTE_RETRIES} attempts. "
-            f"Last error: {last_api_error!r}"
-        ) from last_api_error
-
-    print(
-        f"[main] WARNING: Router returned unparseable JSON on all "
-        f"{MAX_ROUTE_RETRIES} attempt(s). Defaulting to 'non_rag'.",
-        flush=True,
-    )
-
-    fallback_metrics = build_stage_metrics(
-        prompt=routing_prompt,
-        response="non_rag",
-        provider=provider,
-        model_name=model_name,
-        latency=round(time.time() - route_start, 3),
-    )
-
-    return "non_rag", fallback_metrics
-
+# =========================================================
+# Pipeline
+# =========================================================
 
 def run_pipeline(config: MainConfig) -> Dict[str, Any]:
-    from prompt import summarize_non_rag, summarize_rag
     start = time.time()
+
     retrieved_chunks: list[dict[str, Any]] = []
-
     route = "error"
-
     resolved_provider = config.provider or "unknown"
 
-    routing_metrics = {}
-    generation_metrics = {}
-    overall_metrics = {}
+    routing_metrics: dict[str, Any] = {}
+    generation_metrics: dict[str, Any] = {}
+    overall_metrics: dict[str, Any] = {}
 
     try:
         resolved_provider = normalize_provider_name(
@@ -206,10 +135,19 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
         )
 
         print("[INIT] Initializing LLM...", flush=True)
-        llm = build_llm(config.model_name, config.temperature, provider=config.provider)
-        print(f"[INIT] LLM in use: provider={config.provider or 'auto'}, model={config.model_name}", flush=True)
 
-        # Get last N interactions
+        llm = build_llm(
+            config.model_name,
+            config.temperature,
+            provider=config.provider,
+        )
+
+        print(
+            f"[INIT] LLM in use: provider={config.provider or 'auto'}, "
+            f"model={config.model_name}",
+            flush=True,
+        )
+
         recent_memory = CONVERSATION_MEMORY[-MEMORY_WINDOW:]
 
         print("\n[ROUTER] Sending request to LLM...", flush=True)
@@ -222,116 +160,94 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
             memory=recent_memory,
         )
 
-        print(
-            f"[ROUTER DONE] {routing_metrics['time_taken_sec']}s",
-            flush=True,
-        )
-
+        print(f"[ROUTER DONE] {routing_metrics['time_taken_sec']}s", flush=True)
         print(f"[ROUTE] → {route}", flush=True)
 
         if route == "rag":
-            print("[RETRIEVER] Fetching relevant chunks...", flush=True)
-
-            # Lazy import so non-RAG queries start fast
             from retriever import retrieve
 
-            t2 = time.time()
+            print("[RETRIEVER] Fetching relevant chunks...", flush=True)
+
+            retrieve_start = time.time()
+            content_types = decide_content_types(config.question)
+
+            print(f"[RETRIEVER] Content type filter: {content_types}", flush=True)
+
             retrieved_chunks = retrieve(
                 question=config.question,
                 top_k=config.top_k,
                 vector_store_folder_path=str(config.vector_store_path),
                 embed_model=config.embed_model,
+                content_types=content_types,
             )
-            print(f"[RETRIEVER DONE] {round(time.time() - t2, 2)}s", flush=True)
+
+            print(
+                f"[RETRIEVER DONE] {round(time.time() - retrieve_start, 2)}s",
+                flush=True,
+            )
 
             if not retrieved_chunks:
                 answer = (
-                    "No relevant documents were found in the knowledge base for your question. "
-                    "Please rephrase it or ask about a different paper or method."
+                    "No relevant documents were found in the knowledge base for your "
+                    "question. Please rephrase it or ask about a different paper or method."
                 )
 
-                generation_metrics = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "input_cost": 0.0,
-                    "output_cost": 0.0,
-                    "total_cost": 0.0,
-                    "time_taken_sec": 0.0,
-                }
+                generation_metrics = build_empty_generation_metrics()
+
             else:
                 context = "\n\n".join(
-                    f"[Source: {chunk['metadata'].get('paper_name', '?')} | Section: {chunk['metadata'].get('section', '?')}]\n{chunk['content']}"
+                    format_chunk_for_context(chunk)
                     for chunk in retrieved_chunks
                 )
 
                 print("[LLM] Generating final answer...", flush=True)
 
-                final_prompt = summarize_rag(
-                    config.question,
-                    context,
-                    recent_memory,
-                )
-
-                generation_timer = Timer()
-
-                answer = llm.generate_content(
-                    final_prompt
-                ).text
-
-                generation_latency = generation_timer.stop()
-
-                generation_metrics = build_stage_metrics(
-                    prompt=final_prompt,
-                    response=answer,
+                answer, generation_metrics = generate_rag_answer_with_metrics(
+                    question=config.question,
+                    context=context,
+                    memory=recent_memory,
+                    llm=llm,
                     provider=resolved_provider,
                     model_name=config.model_name,
-                    latency=generation_latency,
                 )
 
-                print(f"[LLM DONE] {generation_latency}s", flush=True)
+                print(
+                    f"[LLM DONE] {generation_metrics['time_taken_sec']}s",
+                    flush=True,
+                )
+
         else:
             print("[LLM] Generating final answer...", flush=True)
 
-            final_prompt = summarize_non_rag(
-                config.question,
-                recent_memory,
-            )
-
-            generation_timer = Timer()
-
-            answer = llm.generate_content(
-                final_prompt
-            ).text
-
-            generation_latency = generation_timer.stop()
-
-            generation_metrics = build_stage_metrics(
-                prompt=final_prompt,
-                response=answer,
+            answer, generation_metrics = generate_non_rag_answer_with_metrics(
+                question=config.question,
+                memory=recent_memory,
+                llm=llm,
                 provider=resolved_provider,
                 model_name=config.model_name,
-                latency=generation_latency,
             )
 
-            print(f"[LLM DONE] {generation_latency}s", flush=True)
+            print(
+                f"[LLM DONE] {generation_metrics['time_taken_sec']}s",
+                flush=True,
+            )
 
         elapsed = round(time.time() - start, 2)
 
-        overall_metrics = build_overall_metrics(
-            routing_metrics,
-            generation_metrics,
-            elapsed,
+        overall_metrics = build_overall_from_stage_metrics(
+            routing_metrics=routing_metrics,
+            generation_metrics=generation_metrics,
+            total_pipeline_time=elapsed,
         )
 
-        # Store current interaction
+        CONVERSATION_MEMORY.append(
+            {
+                "question": config.question,
+                "answer": answer,
+                "route": route,
+            }
+        )
 
-        CONVERSATION_MEMORY.append({
-            "question": config.question,
-            "answer": answer,
-            "route": route,
-        })
-
-        # Keep memory bounded
         if len(CONVERSATION_MEMORY) > MEMORY_WINDOW:
             CONVERSATION_MEMORY.pop(0)
 
@@ -339,19 +255,14 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
             "question": config.question,
             "route": route,
             "answer": answer,
-            "provider": config.provider,
+            "provider": resolved_provider,
             "model_name": config.model_name,
             "temperature": config.temperature,
             "vector_store_path": str(config.vector_store_path),
             "top_k": config.top_k,
             "time_taken_sec": elapsed,
             "retrieved_chunks": [
-                {
-                    "similarity": chunk["similarity"],
-                    "paper_name": chunk["metadata"].get("paper_name", ""),
-                    "section": chunk["metadata"].get("section", ""),
-                    "content": chunk["content"],
-                }
+                serialize_retrieved_chunk(chunk)
                 for chunk in retrieved_chunks
             ],
         }
@@ -362,6 +273,7 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
         overall_metrics = {
             "total_input_tokens": 0,
             "total_output_tokens": 0,
+            "total_tokens": 0,
             "grand_total_cost": 0.0,
             "total_pipeline_time_sec": elapsed,
         }
@@ -377,22 +289,19 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
             error=str(exc),
         )
 
-    out_path = save_result(config.output_json_path, result, append=True)
+    out_path = save_result(
+        config.output_json_path,
+        result,
+        append=True,
+    )
 
     metrics_payload = {
-
         "question": config.question,
-
         "route": route,
-
         "provider": resolved_provider,
-
         "model_name": config.model_name,
-
         "routing_metrics": routing_metrics,
-
         "generation_metrics": generation_metrics,
-
         "overall_metrics": overall_metrics,
     }
 
@@ -402,25 +311,19 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
     )
 
     print("\n========== RESULT ==========", flush=True)
+
     if result.get("error"):
         print(f"ERROR: {result['error']}", flush=True)
     else:
         print(result.get("answer", ""), flush=True)
+
     print("============================", flush=True)
     print(f"Route        : {result.get('route')}", flush=True)
     print(f"Result saved : {out_path}", flush=True)
     print(f"Time taken   : {result.get('time_taken_sec')}s", flush=True)
 
     print("\n========== METRICS ==========", flush=True)
-
-    print(
-        json.dumps(
-            metrics_payload,
-            indent=2,
-        ),
-        flush=True,
-    )
-
+    print(json.dumps(metrics_payload, indent=2), flush=True)
     print("=============================", flush=True)
 
     return result
@@ -428,6 +331,9 @@ def run_pipeline(config: MainConfig) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     print("[BOOT] Starting main.py...", flush=True)
+
     config = parse_args()
+
     print(f"[CONFIG] {config}", flush=True)
+
     run_pipeline(config)
