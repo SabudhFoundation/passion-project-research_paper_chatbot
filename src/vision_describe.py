@@ -179,8 +179,35 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
 # =========================================================
 
 def already_generated(artifact: dict[str, Any]) -> bool:
-    return artifact.get("vision_status") == VisionStatus.GENERATED.value
+    """
+    Treat an artifact as already generated only if it has BOTH:
+    1. vision_status == generated
+    2. a real non-empty vision_description
 
+    This prevents empty/generated or placeholder descriptions from being skipped.
+    """
+    status = str(artifact.get("vision_status", "") or "").strip().lower()
+
+    description = str(
+        artifact.get("vision_description", "") or ""
+    ).strip()
+
+    invalid_descriptions = {
+        "",
+        "vision description not generated yet.",
+        "not generated",
+        "not_generated",
+        "none",
+        "null",
+    }
+
+    if status != VisionStatus.GENERATED.value:
+        return False
+
+    if description.lower() in invalid_descriptions:
+        return False
+
+    return True
 
 def has_existing_description(artifact: dict[str, Any]) -> bool:
     description = str(artifact.get("vision_description", "") or "").strip()
