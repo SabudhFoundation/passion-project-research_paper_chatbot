@@ -673,7 +673,6 @@ def render_visual_source(chunk: dict[str, Any], index: int) -> None:
     caption = chunk_value(chunk, "caption", "")
     content = chunk.get("content", "") or ""
     image_path = resolve_project_path(chunk_value(chunk, "image_path", ""))
-    mermaid = chunk_value(chunk, "mermaid", "")
 
     if caption:
         st.markdown("**Caption**")
@@ -712,17 +711,6 @@ def render_visual_source(chunk: dict[str, Any], index: int) -> None:
     if str(vision_description).strip().lower() not in invalid_vision_descriptions:
         with st.expander("View vision description", expanded=False):
             st.write(vision_description)
-    else:
-        st.caption("Vision description is not available for this figure source.")
-
-    mermaid = clean_mermaid_code(mermaid)
-
-    if mermaid:
-        with st.expander("View Mermaid diagram", expanded=False):
-            render_mermaid_chart(mermaid)
-
-        with st.expander("View Mermaid source", expanded=False):
-            st.code(mermaid, language="mermaid")
 
     if content:
         with st.expander("View retrieved context", expanded=False):
