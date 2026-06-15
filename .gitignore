@@ -198,6 +198,9 @@ Temporary Items/
 # luasrc (if you have a local Lua config)
 .luarc.json
 
+# Ignore Deepeval Folder
+.deepeval/
+
 # Git keepers (if you intentionally want to keep empty dirs tracked,
 # you can keep a .gitkeep or README.md in that folder—but ignore all other content)
 # If you do keep a blank `.gitkeep` file, then add: 
